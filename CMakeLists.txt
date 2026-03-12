@@ -482,6 +482,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/sampler/topk_topp_sampler.cpp"
       "csrc/xpu/sycl/deepseek_scaling_rope.cpp"
       "csrc/xpu/rand/exponential.cpp"
+      "csrc/xpu/sycl/multimodal_rope.cpp"
       "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp"
       "csrc/xpu/utils.cpp"
       "csrc/xpu/gdn_attn/gdn_attn_interface.cpp")
