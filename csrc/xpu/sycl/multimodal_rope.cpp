@@ -31,7 +31,8 @@ class multimodal_rotary_embedding_kernel {
       const int64_t head_stride_,
       const int num_heads_,
       const int num_kv_heads_,
-      const int head_size_)
+      const int head_size_,
+      sycl::local_accessor<scalar_t, 1> shared_cache_)
       : positions(positions_),
         query(query_),
         key(key_),
@@ -44,7 +45,8 @@ class multimodal_rotary_embedding_kernel {
         head_stride(head_stride_),
         num_heads(num_heads_),
         num_kv_heads(num_kv_heads_),
-        head_size(head_size_) {
+        head_size(head_size_),
+        shared_cache(shared_cache_) {
     for (int s = 0; s < num_mrope_sections_; ++s)
       mrope_section[s] = mrope_section_data[s];
   }
@@ -54,24 +56,31 @@ class multimodal_rotary_embedding_kernel {
     // Each work-group handles one token.
     const int token_idx = item_ct1.get_group(2);
     const int embed_dim = rot_dim / 2;
+    const int local_id = item_ct1.get_local_id(2);
+    const int local_range = item_ct1.get_local_range(2);
 
-    // Build cos/sin cache for this token (private memory per thread).
-    // Zero-initialize
-    scalar_t merged_cache[MROPE_MAX_ROT_DIM] =
-        {};  // [cos | sin], size = rot_dim
+    // Threads cooperatively load the cache into Shared Local Memory
     int cumsum = 0;
     for (int s = 0; s < num_mrope_sections; ++s) {
       const int lo = cumsum;
       const int hi = lo + mrope_section[s];
+      const int section_len = hi - lo;
       cumsum = hi;
+      
       const int64_t pos = positions[s * num_tokens + token_idx];
       const scalar_t* src = cos_sin_cache + pos * rot_dim;
-      for (int r = lo; r < hi; ++r) {
-        merged_cache[r] = src[r];                          // cos slice
-        merged_cache[embed_dim + r] = src[embed_dim + r];  // sin slice
+      
+      // Distribute the reads across all available threads in the block
+      for (int r = local_id; r < section_len; r += local_range) {
+        shared_cache[lo + r] = src[lo + r];                          // cos slice
+        shared_cache[embed_dim + lo + r] = src[embed_dim + lo + r];  // sin slice
       }
     }
-    const scalar_t* cache_ptr = merged_cache;
+    
+    // Wait for the SLM to be fully populated by ALL threads
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    const scalar_t* cache_ptr = &shared_cache[0];
 
     apply_rotary_embedding<scalar_t, IS_NEOX>(
         query,
@@ -103,6 +112,7 @@ class multimodal_rotary_embedding_kernel {
   const int num_heads;
   const int num_kv_heads;
   const int head_size;
+  sycl::local_accessor<scalar_t, 1> shared_cache;
 };
 
 }  // namespace vllm
@@ -198,6 +208,7 @@ void call_multimodal_rotary_embedding_kernel(
   auto& queue = vllm::xpu::vllmGetQueue();
   if (is_neox) {
     queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<sycl_t, 1> shared_cache(sycl::range<1>(rot_dim), cgh);
       cgh.parallel_for(
           sycl::nd_range<3>(grid * block, block),
           vllm::multimodal_rotary_embedding_kernel<sycl_t, true>(
@@ -214,10 +225,12 @@ void call_multimodal_rotary_embedding_kernel(
               head_stride,
               num_heads,
               num_kv_heads,
-              head_size));
+              head_size,
+              shared_cache));
     });
   } else {
     queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<sycl_t, 1> shared_cache(sycl::range<1>(rot_dim), cgh);
       cgh.parallel_for(
           sycl::nd_range<3>(grid * block, block),
           vllm::multimodal_rotary_embedding_kernel<sycl_t, false>(
@@ -234,7 +247,8 @@ void call_multimodal_rotary_embedding_kernel(
               head_stride,
               num_heads,
               num_kv_heads,
-              head_size));
+              head_size,
+              shared_cache));
     });
   }
 }
