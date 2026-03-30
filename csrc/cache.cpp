@@ -567,6 +567,7 @@ void reshape_and_cache_flash(
   TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
 
   sycl::range<1> grid(num_tokens);
+  // TANNER: sweep here
   sycl::range<1> block(std::min(num_heads * head_size, 1024));
   const at::DeviceGuard device_guard(key.device());
   auto& queue = vllm::xpu::vllmGetQueue();
