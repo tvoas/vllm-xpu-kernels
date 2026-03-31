@@ -512,7 +512,7 @@ void reshape_and_cache(
   int value_stride = value.stride(0);
 
   sycl::range<1> grid(num_tokens);
-  sycl::range<1> block(std::min(num_heads * head_size, 1024));
+  sycl::range<1> block(std::min(num_heads * head_size, 512));
   const at::DeviceGuard device_guard(key.device());
   auto& queue = vllm::xpu::vllmGetQueue();
 
@@ -568,7 +568,7 @@ void reshape_and_cache_flash(
 
   sycl::range<1> grid(num_tokens);
   // TANNER: sweep here
-  sycl::range<1> block(std::min(num_heads * head_size, 1024));
+  sycl::range<1> block(std::min(num_heads * head_size, 512));
   const at::DeviceGuard device_guard(key.device());
   auto& queue = vllm::xpu::vllmGetQueue();
 
