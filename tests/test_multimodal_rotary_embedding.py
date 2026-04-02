@@ -2,145 +2,121 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Tests for Multi-Modal Rotary Embedding (M-RoPE) SYCL kernel.
-
-M-RoPE (used by e.g. Qwen2-VL) partitions the rotation dimensions into
-sections so that each section can encode a different positional axis
-(e.g. temporal / height / width for video/image tokens, or a single text
-position for text tokens).
-
-Tensor shapes
-─────────────
-positions      : [num_mrope_sections, num_tokens]  int64
-query / key    : [num_tokens, num_heads * head_size]  or
-                 [num_tokens, num_heads, head_size]
-cos_sin_cache  : [max_position, rot_dim]  float
-mrope_section  : [num_mrope_sections]  int32, on device;
-                 values in embed_dim = rot_dim/2 units, must sum to embed_dim
 """
 
 from typing import Optional
-
+import csv
+import time
+import os
 import pytest
 import torch
+from collections import defaultdict
 
 import tests.register_ops as ops  # noqa: F401 – ensure custom ops are loaded
+from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
-# ─── pure-Python reference ───────────────────────────────────────────────────
+CSV_FILENAME = "test_mrope.csv"
 
+@pytest.fixture(scope="session", autouse=True)
+def setup_csv():
+    categories = [
+        "dtype", "num_tokens", "num_sections", "num_heads", "num_kv_heads", 
+        "head_size", "rot_dim", "is_neox_style", "use_key", 
+        "use_triton_as_native", "include_python_framing"
+    ]
 
-def _apply_rotary_emb_torch(x, cos, sin, is_neox_style):
-    """Apply RoPE to a single head slice x[..., rot_dim]."""
-    cos = cos.to(x.dtype)
-    sin = sin.to(x.dtype)
-    if is_neox_style:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-    else:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
-    else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+    with open(CSV_FILENAME, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(categories + [
+            "status", "custom_time_us", "custom_bw_gbps", "custom_tflops",
+            "torch_time_us", "torch_bw_gbps", "torch_tflops", "speedup_ratio"
+        ])
 
+    yield
 
-def _compute_cos_sin_cache(max_position: int,
-                           rot_dim: int,
-                           base: float = 10000.0) -> torch.Tensor:
-    inv_freq = 1.0 / (base**(torch.arange(
-        0, rot_dim, 2, dtype=torch.float, device="cpu") / rot_dim))
-    t = torch.arange(max_position, dtype=torch.float, device="cpu")
-    freqs = torch.einsum("i,j->ij", t, inv_freq)  # [max_pos, rot_dim//2]
-    return torch.cat((freqs.cos(), freqs.sin()), dim=-1)  # [max_pos, rot_dim]
+    if not os.path.exists(CSV_FILENAME):
+        return
 
+    global_sp = []
+    global_bw = []
+    global_tf = []
+    global_pass = 0
+    global_total = 0
 
-def _ref_multimodal_rotary_embedding(
-    positions: torch.Tensor,  # [num_sections, num_tokens]  CPU int64
-    query: torch.Tensor,  # [num_tokens, num_heads, head_size]  CPU
-    key: Optional[torch.Tensor],  # same or None
-    cos_sin_cache: torch.Tensor,  # [max_position, rot_dim]  CPU float
-    is_neox_style: bool,
-    mrope_section: list[int],  # Python list, values in embed_dim units
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    num_sections = len(mrope_section)
-    num_tokens = positions.shape[1]
-    rot_dim = cos_sin_cache.shape[1]
-    embed_dim = rot_dim // 2
+    # Structure: dict[category_name][category_value] = {"sp": [], "bw": [], "tf": [], "passes": 0, "total": 0}
+    grouped = defaultdict(lambda: defaultdict(lambda: {"sp": [], "bw": [], "tf": [], "passes": 0, "total": 0}))
 
-    q_out = query.clone().float()
-    k_out = key.clone().float() if key is not None else None
+    with open(CSV_FILENAME, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            status = row["status"]
+            global_total += 1
+            is_pass = (status == "PASS")
+            if is_pass:
+                global_pass += 1
+                try:
+                    sp = float(row["speedup_ratio"])
+                    bw = float(row["custom_bw_gbps"])
+                    tf = float(row["custom_tflops"])
+                    global_sp.append(sp)
+                    global_bw.append(bw)
+                    global_tf.append(tf)
+                except ValueError:
+                    is_pass = False
 
-    # cumulative section boundaries [0, s0, s0+s1, ...]
-    bounds = [0]
-    for s in mrope_section:
-        bounds.append(bounds[-1] + s)
+            for cat in categories:
+                val = row[cat]
+                grouped[cat][val]["total"] += 1
+                if is_pass:
+                    grouped[cat][val]["passes"] += 1
+                    grouped[cat][val]["sp"].append(sp)
+                    grouped[cat][val]["bw"].append(bw)
+                    grouped[cat][val]["tf"].append(tf)
 
-    for sec in range(num_sections):
-        lo, hi = bounds[sec], bounds[sec + 1]  # rot_offset range [lo, hi)
-        for tok in range(num_tokens):
-            pos = positions[sec, tok].item()
-            # cos/sin for this token position, shape [embed_dim]
-            cos_full = cos_sin_cache[pos, :embed_dim]  # [embed_dim]
-            sin_full = cos_sin_cache[pos, embed_dim:]  # [embed_dim]
-            cos_sec = cos_full[lo:hi]  # [section_size]
-            sin_sec = sin_full[lo:hi]
+    if global_total == 0:
+        return
 
-            # Apply rotation only to slice [lo:hi] of the rotation dims.
-            if is_neox_style:
-                # NeoX: dim i pairs with dim embed_dim+i.
-                # Section [lo, hi) rotates pairs (lo+j, embed_dim+lo+j).
-                q1 = q_out[tok, :, lo:hi].clone()  # [heads, sec_size]
-                q2 = q_out[tok, :, embed_dim + lo:embed_dim +
-                           hi].clone()  # [heads, sec_size]
-                q_out[tok, :, lo:hi] = q1 * cos_sec - q2 * sin_sec
-                q_out[tok, :, embed_dim + lo:embed_dim +
-                      hi] = q2 * cos_sec + q1 * sin_sec
-                if k_out is not None:
-                    k1 = k_out[tok, :, lo:hi].clone()
-                    k2 = k_out[tok, :, embed_dim + lo:embed_dim + hi].clone()
-                    k_out[tok, :, lo:hi] = k1 * cos_sec - k2 * sin_sec
-                    k_out[tok, :, embed_dim + lo:embed_dim +
-                          hi] = k2 * cos_sec + k1 * sin_sec
-            else:
-                # GPT-J: pairs are (2i, 2i+1) — the flat indices are 2*lo..2*hi
-                q_slice = q_out[tok, :, 2 * lo:2 * hi]  # [heads, 2*sec_size]
-                q_out[tok, :, 2 * lo:2 * hi] = _apply_rotary_emb_torch(
-                    q_slice, cos_sec, sin_sec, is_neox_style=False)
-                if k_out is not None:
-                    k_out[tok, :, 2 * lo:2 * hi] = _apply_rotary_emb_torch(
-                        k_out[tok, :, 2 * lo:2 * hi],
-                        cos_sec,
-                        sin_sec,
-                        is_neox_style=False)
+    g_avg_sp = sum(global_sp) / len(global_sp) if global_sp else 0.0
+    g_pass_pct = (global_pass / global_total) * 100
 
-    return q_out, k_out
+    g_mu_bw = sum(global_bw)/len(global_bw) if global_bw else 0
+    g_min_bw = min(global_bw) if global_bw else 0
+    g_max_bw = max(global_bw) if global_bw else 0
 
+    g_mu_tf = sum(global_tf)/len(global_tf) if global_tf else 0
+    g_min_tf = min(global_tf) if global_tf else 0
+    g_max_tf = max(global_tf) if global_tf else 0
 
-# ─── helpers ─────────────────────────────────────────────────────────────────
+    print("\n\n" + "=" * 140)
+    print(f"{'PARAMETER':<23} {'VALUE':<12} {'PASS%':<7} {'SPEEDUP VS PYTORCH':<24} | {'BW (GB/s) [Mean / Min / Max]':<32} | {'TFLOPS [Mean / Min / Max]'}")
+    print("-" * 140)
+    print(f"{'Global Average':<23} {'-':<12} {g_pass_pct:<6.1f}% {g_avg_sp:<8.3f} (100.0%)       | {g_mu_bw:<8.1f} / {g_min_bw:<8.1f} / {g_max_bw:<8.1f}   | {g_mu_tf:<8.3f} / {g_min_tf:<8.3f} / {g_max_tf:<8.3f}")
+    print("-" * 140)
 
+    for cat in categories:
+        print(f"{cat.upper().replace('_', ' ')}")
+        for val, data in grouped[cat].items():
+            pass_pct = (data["passes"] / data["total"]) * 100
 
-def _run_kernel(device, positions, query, key, cos_sin_cache, is_neox_style,
-                mrope_section_list):
-    """Call the XPU kernel and return (query_out, key_out) on CPU."""
-    q_xpu = query.clone().to(device=device)
-    k_xpu = key.clone().to(device=device) if key is not None else None
-    pos_xpu = positions.to(device=device)
-    cache_xpu = cos_sin_cache.to(device=device, dtype=query.dtype)
+            sp_list, bw_list, tf_list = data["sp"], data["bw"], data["tf"]
+            valid = len(sp_list) > 0
 
-    # head_size = last dim of query when viewed as [tokens, heads, head_size]
-    head_size = q_xpu.shape[-1]
+            grp_sp = sum(sp_list) / len(sp_list) if valid else 0.0
+            vs_g = (grp_sp / g_avg_sp) * 100 if (valid and g_avg_sp > 0) else 0.0
 
-    # mrope_section is passed directly as a Python list of ints.
-    ops.multimodal_rotary_embedding(pos_xpu, q_xpu, k_xpu, head_size,
-                                    cache_xpu, is_neox_style,
-                                    mrope_section_list)
+            mu_bw = sum(bw_list) / len(bw_list) if valid else 0.0
+            min_bw = min(bw_list) if valid else 0.0
+            max_bw = max(bw_list) if valid else 0.0
 
-    return q_xpu.cpu().float(), (k_xpu.cpu().float()
-                                 if k_xpu is not None else None)
+            mu_tf = sum(tf_list) / len(tf_list) if valid else 0.0
+            min_tf = min(tf_list) if valid else 0.0
+            max_tf = max(tf_list) if valid else 0.0
 
+            sp_str = f"{grp_sp:<8.3f} ({vs_g:>5.1f}%)" if valid else "N/A"
+            print(f"{'':<23} {val:<12} {pass_pct:<6.1f}% {sp_str:<24} | {mu_bw:<8.1f} / {min_bw:<8.1f} / {max_bw:<8.1f}   | {mu_tf:<8.3f} / {min_tf:<8.3f} / {max_tf:<8.3f}")
+    print("=" * 140 + "\n")
 
-# ─── test parameters ─────────────────────────────────────────────────────────
+# ─── test & benchmark ────────────────────────────────────────────────────────
 
 MINI_PYTEST_PARAMS = {
     "default": {
@@ -150,90 +126,189 @@ MINI_PYTEST_PARAMS = {
     }
 }
 
-
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("device", ["xpu"])
 @pytest.mark.parametrize("is_neox_style", [True, False])
 @pytest.mark.parametrize("use_key", [True, False])
 @pytest.mark.parametrize(
-    "head_size,rot_dim,mrope_section",
+    "num_heads,num_kv_heads,head_size,rot_dim,mrope_section",
     [
-        # 3-section M-RoPE (typical for Qwen2-VL with head_size=128)
-        (64, 64, [8, 12, 12]),  # sum=32=embed_dim
-        (32, 32, [4, 4, 8]),  # sum=16=embed_dim
-        # single-section M-RoPE must match standard RoPE
-        (32, 32, [16]),
+        # Real-world M-RoPE: Qwen2-VL 7B (GQA, rot=head, VEC_SIZE=4 valid)
+        (28, 4, 128, 128, [16, 24, 24]),
+        
+        # Real-world M-RoPE: Qwen2-VL 2B (MHA, rot=head, VEC_SIZE=4 valid)
+        (32, 32, 128, 128, [16, 24, 24]),
+
+        # Large Head Size: Gemma-2 / Pixtral style (GQA)
+        (16, 8, 256, 256, [32, 48, 48]),
+
+        # Standard RoPE Fallback: Single section, mapped to standard RoPE
+        (32, 32, 128, 128, [64]),
+
+        # Partial RoPE: rot_dim < head_size (e.g., rot=64, head=128)
+        (16, 4, 128, 64, [8, 12, 12]),
+
+        # Dynamic Dispatch Test: Forces VEC_SIZE=2 (because 10 % 4 != 0)
+        (16, 16, 64, 64, [10, 10, 12]),
+
+        # Massive Model: Qwen2-VL 72B (GQA, high head count)
+        (64, 8, 128, 128, [16, 24, 24]),
     ],
 )
-@pytest.mark.parametrize("num_tokens", [1, 16, 128])
-def test_multimodal_rotary_embedding(device, is_neox_style, use_key, head_size,
-                                     rot_dim, mrope_section, num_tokens):
-    max_position = 512
-    num_heads = 4
-    num_kv_heads = 2
+@pytest.mark.parametrize("num_tokens", [
+    1, 8,         # Decoding phase (extremely low token count, pure memory bandwidth bound)
+    16, 128,      # Short prefill
+    512, 1024,    # Medium prefill
+    2048, 4096,   # Long prefill
+    8192          # Extended context
+])
+@pytest.mark.usefixtures("default_vllm_config")
+def test_multimodal_rotary_embedding(dtype, device, is_neox_style, use_key, num_heads,
+                                     num_kv_heads, head_size, rot_dim, mrope_section, num_tokens):
+    if not hasattr(ops, "multimodal_rotary_embedding") and not hasattr(torch.ops._C, "multimodal_rotary_embedding"):
+        pytest.fail("M-RoPE Custom XPU Kernel not found! Test aborted.")
+
+    max_position = 8192
     base = 10000.0
     num_sections = len(mrope_section)
 
-    cos_sin_cache = _compute_cos_sin_cache(max_position, rot_dim, base)
+    mrope_layer = MRotaryEmbedding(
+        head_size=head_size,
+        rotary_dim=rot_dim,
+        max_position_embeddings=max_position,
+        base=base,
+        is_neox_style=is_neox_style,
+        dtype=dtype,
+        mrope_section=mrope_section
+    )
 
-    # positions: different per section to exercise M-RoPE routing
+    # Extract cos/sin cache and send to device
+    cos_sin_cache = mrope_layer.cos_sin_cache.to(dtype=dtype, device=device)
+
+    # 3D positions logic (T, H, W)
     positions = torch.stack([
-        torch.randint(0, max_position, (num_tokens, ), device="cpu")
+        torch.randint(0, max_position, (num_tokens,), device=device)
         for _ in range(num_sections)
-    ])  # [num_sections, num_tokens]
+    ])
 
-    query = torch.randn(num_tokens, num_heads, head_size, device="cpu")
-    key = torch.randn(num_tokens, num_kv_heads, head_size,
-                      device="cpu") if use_key else None
+    # vLLM explicitly uses flattened queries and keys for the standard interface
+    query = torch.randn(num_tokens, num_heads * head_size, dtype=dtype, device=device)
+    key = torch.randn(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device) if use_key else None
 
-    # ── reference ──
-    ref_q, ref_k = _ref_multimodal_rotary_embedding(positions, query, key,
-                                                    cos_sin_cache,
-                                                    is_neox_style,
-                                                    mrope_section)
+    # Track metrics mapped by variant
+    timings = {}
+    status = "FAIL"
 
-    # ── kernel ──
-    # Kernel accepts [num_tokens, num_heads, head_size] layout.
-    xpu_q, xpu_k = _run_kernel(device, positions, query, key, cos_sin_cache,
-                               is_neox_style, mrope_section)
+    try:
+        # 1. Accuracy
+        with torch.no_grad():
+            dummy_k_ref = key.cpu() if key is not None else torch.zeros(num_tokens, num_kv_heads * head_size, dtype=dtype)
+            ref_q, ref_k = mrope_layer.forward_native(positions.cpu(), query.cpu(), dummy_k_ref)
 
-    torch.testing.assert_close(xpu_q, ref_q.cpu(), atol=1e-4, rtol=1e-4)
-    if use_key:
-        torch.testing.assert_close(xpu_k, ref_k.cpu(), atol=1e-4, rtol=1e-4)
+        xpu_q = query.clone()
+        xpu_k = key.clone() if key is not None else None
 
+        out_q, out_k = mrope_layer.forward_xpu(positions, xpu_q, xpu_k)
 
-@pytest.mark.parametrize("device", ["xpu"])
-@pytest.mark.parametrize("is_neox_style", [True, False])
-def test_mrope_matches_standard_rope_for_text_tokens(device, is_neox_style):
-    """When num_sections=1 and section covers all embed_dim, M-RoPE and
-    standard RoPE must produce identical results."""
-    max_position = 256
-    num_tokens = 32
-    num_heads = 4
-    head_size = 32
-    rot_dim = 32
-    embed_dim = rot_dim // 2
-    base = 10000.0
+        if dtype == torch.float32:
+            atol, rtol = 1e-5, 1e-5
+        elif dtype == torch.float16:
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 2e-2, 2e-2
 
-    cos_sin_cache = _compute_cos_sin_cache(max_position, rot_dim, base)
+        torch.testing.assert_close(out_q.cpu().float(), ref_q.float(), atol=atol, rtol=rtol)
+        if use_key:
+            torch.testing.assert_close(out_k.cpu().float(), ref_k.float(), atol=atol, rtol=rtol)
 
-    positions_1d = torch.randint(0, max_position, (num_tokens, ), device="cpu")
-    positions_mrope = positions_1d.unsqueeze(0)  # [1, num_tokens]
+        # 2. Benchmarking helper
+        def bench_fn(fn, warmup=100, iters=300):
+            for _ in range(warmup): fn()
+            torch.xpu.synchronize()
+            start_time = time.perf_counter()
+            for _ in range(iters): fn()
+            torch.xpu.synchronize()
+            return (time.perf_counter() - start_time) / iters
 
-    query = torch.randn(num_tokens, num_heads, head_size, device="cpu")
-    key = torch.randn(num_tokens, num_heads, head_size, device="cpu")
+        # Custom Kernel (Framed)
+        timings["custom_framed"] = bench_fn(lambda: mrope_layer.forward_xpu(positions, xpu_q, xpu_k), warmup=100, iters=1000)
 
-    # --- standard RoPE via XPU op ---
-    q_std = query.clone().to(device)
-    k_std = key.clone().to(device)
-    pos_std = positions_1d.to(device)
-    cache_xpu = cos_sin_cache.to(device)
-    ops.rotary_embedding(pos_std, q_std, k_std, head_size, cache_xpu,
-                         is_neox_style)
+        # Custom Kernel (Pure)
+        q_view = xpu_q.view(num_tokens, num_heads, head_size)
+        k_view = xpu_k.view(num_tokens, num_kv_heads, head_size) if xpu_k is not None else None
+        timings["custom_pure"] = bench_fn(lambda: ops.multimodal_rotary_embedding(
+            positions, q_view, k_view, head_size, cos_sin_cache, is_neox_style, mrope_section
+        ), warmup=100, iters=1000)
 
-    # --- M-RoPE with single section ---
-    mrope_section = [embed_dim]
-    q_m, k_m = _run_kernel(device, positions_mrope, query, key, cos_sin_cache,
-                           is_neox_style, mrope_section)
+        # Baseline Benchmark (Torch Native)
+        q_ref = query.clone()
+        k_ref_bench = key.clone() if key is not None else torch.zeros(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device)
+        timings["torch"] = bench_fn(lambda: mrope_layer.forward_native(positions, q_ref, k_ref_bench))
 
-    torch.testing.assert_close(q_m, q_std.cpu().float(), atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(k_m, k_std.cpu().float(), atol=1e-4, rtol=1e-4)
+        # Baseline Benchmark (Triton) - Triton is hardcoded for exactly 3 sections.
+        if num_sections == 3:
+            timings["triton"] = bench_fn(lambda: mrope_layer.forward_cuda(positions, q_ref, k_ref_bench))
+
+        status = "PASS"
+    except Exception as e:
+        status = f"FAIL: {str(e)}"
+
+    finally:
+        # Common metric factors
+        # RoPE only reads/writes the rot_dim elements, NOT the whole head_size
+        accessed_q = num_tokens * num_heads * rot_dim
+        accessed_k = (num_tokens * num_kv_heads * rot_dim) if use_key else 0
+        
+        # 2x multiplier for Read + Write
+        total_bytes = (2 * accessed_q + 2 * accessed_k) * query.element_size()
+        
+        # Add positions read
+        total_bytes += positions.numel() * positions.element_size()
+
+        # Add cos/sin cache reads (rot_dim elements per token)
+        total_bytes += num_tokens * rot_dim * cos_sin_cache.element_size()
+
+        total_flops = 4 * (num_tokens * num_heads * rot_dim)
+        if use_key:
+            total_flops += 4 * (num_tokens * num_kv_heads * rot_dim)
+
+        # Report combinations
+        triton_opts = [True, False] if num_sections == 3 else [False]
+        triton_opts = [True] if num_sections == 3 else []
+        frame_opts = [True, False]
+        frame_opts = [True]
+
+        with open(CSV_FILENAME, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            for use_triton_as_native in triton_opts:
+                for include_python_framing in frame_opts:
+                    c_time = timings.get("custom_framed" if include_python_framing else "custom_pure", 0.0)
+                    b_time = timings.get("triton" if use_triton_as_native else "torch", 0.0)
+
+                    if status == "PASS" and c_time > 0 and b_time > 0:
+                        c_bw, c_tf = (total_bytes / 1e9) / c_time, (total_flops / 1e12) / c_time
+                        b_bw, b_tf = (total_bytes / 1e9) / b_time, (total_flops / 1e12) / b_time
+                        speedup = b_time / c_time
+
+                        base_name = "Triton" if use_triton_as_native else "Torch"
+                        print(f"\n[M-RoPE {dtype}] Toks={num_tokens} QHeads={num_heads} KVHeads={num_kv_heads} Head={head_size} RotD={rot_dim} Sec={num_sections} has_K={use_key} Neox={is_neox_style} Include Python Frame={include_python_framing} | "
+                              f"Custom: {c_time*1e6:.2f} us ({c_bw:.2f} GB/s, {c_tf:.4f} TFLOPS) | "
+                              f"{base_name}: {b_time*1e6:.2f} us ({b_bw:.2f} GB/s, {b_tf:.4f} TFLOPS) | "
+                              f"Speedup: {speedup:.2f}x")
+
+                        writer.writerow([
+                            str(dtype).split('.')[-1], num_tokens, num_sections, num_heads, num_kv_heads, 
+                            head_size, rot_dim, is_neox_style, use_key, use_triton_as_native, 
+                            include_python_framing, status,
+                            c_time * 1e6, c_bw, c_tf,
+                            b_time * 1e6, b_bw, b_tf, speedup
+                        ])
+                    else:
+                        print(f"\n[M-RoPE {dtype}] Toks={num_tokens} QHeads={num_heads} KVHeads={num_kv_heads} Head={head_size} RotD={rot_dim} Sec={num_sections} has_K={use_key} Neox={is_neox_style} Include Python Frame={include_python_framing} | {status}")
+                        writer.writerow([
+                            str(dtype).split('.')[-1], num_tokens, num_sections, num_heads, num_kv_heads, 
+                            head_size, rot_dim, is_neox_style, use_key, use_triton_as_native, 
+                            include_python_framing, "FAIL",
+                            0, 0, 0, 0, 0, 0, 0
+                        ])

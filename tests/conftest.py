@@ -2,6 +2,7 @@
 import os
 
 import pytest
+from vllm.config.vllm import VllmConfig, set_current_vllm_config
 
 from tests.utils import create_kv_caches_with_random
 
@@ -50,3 +51,9 @@ def reset_default_device():
 @pytest.fixture()
 def kv_cache_factory():
     return create_kv_caches_with_random
+
+@pytest.fixture(scope="function")
+def default_vllm_config():
+    config = VllmConfig()
+    with set_current_vllm_config(config):
+        yield config
