@@ -1,4 +1,5 @@
 #include <sycl/sycl.hpp>
+#include <algorithm>
 #include "utils.h"
 #include "dispatch_utils.h"
 #include "rotary_embedding.hpp"
@@ -17,12 +18,11 @@ template <typename scalar_t, bool IS_NEOX>
 class multimodal_rotary_embedding_kernel {
  public:
   multimodal_rotary_embedding_kernel(
-      const int64_t* __restrict__ positions_,  // [num_mrope_sections,
-                                               // num_tokens]
+      const int64_t* __restrict__ positions_,
       scalar_t* __restrict__ query_,
       scalar_t* __restrict__ key_,
-      const scalar_t* __restrict__ cos_sin_cache_,  // [max_position, rot_dim]
-      const int* mrope_section_data,  // host array [num_mrope_sections]
+      const scalar_t* __restrict__ cos_sin_cache_,
+      const int* mrope_section_data,
       const int num_mrope_sections_,
       const int num_tokens_,
       const int rot_dim_,
@@ -32,7 +32,7 @@ class multimodal_rotary_embedding_kernel {
       const int num_heads_,
       const int num_kv_heads_,
       const int head_size_,
-      sycl::local_accessor<scalar_t, 1> shared_cache_)
+      const int tokens_per_block_) // Passed directly from launch
       : positions(positions_),
         query(query_),
         key(key_),
@@ -46,55 +46,111 @@ class multimodal_rotary_embedding_kernel {
         num_heads(num_heads_),
         num_kv_heads(num_kv_heads_),
         head_size(head_size_),
-        shared_cache(shared_cache_) {
+        tokens_per_block(tokens_per_block_) {
     for (int s = 0; s < num_mrope_sections_; ++s)
       mrope_section[s] = mrope_section_data[s];
   }
 
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
-    // Each work-group handles one token.
-    const int token_idx = item_ct1.get_group(2);
-    const int embed_dim = rot_dim / 2;
-    const int local_id = item_ct1.get_local_id(2);
-    const int local_range = item_ct1.get_local_range(2);
 
-    // Threads cooperatively load the cache into Shared Local Memory
+    constexpr int VEC_SIZE = 2;
+    using vec_t = sycl::vec<scalar_t, VEC_SIZE>;
+
+    const int embed_dim = rot_dim / 2;
+    const int num_vec_dims = embed_dim / VEC_SIZE;
+
+    const int token_group = item_ct1.get_group(2);
+    const int local_id = item_ct1.get_local_id(2);
+
+    // Map thread to a specific token chunk and dimension
+    const int t_offset = local_id / num_vec_dims;
+    const int vec_dim_idx = local_id % num_vec_dims;
+
+    const int token_idx = token_group * tokens_per_block + t_offset;
+    if (token_idx >= num_tokens) return;
+
+    const int dim_idx = vec_dim_idx * VEC_SIZE;
+
+    // 1. Calculate exactly which M-RoPE section this dim falls into
+    int section_idx = 0;
+    int section_offset = dim_idx;
     int cumsum = 0;
     for (int s = 0; s < num_mrope_sections; ++s) {
-      const int lo = cumsum;
-      const int hi = lo + mrope_section[s];
-      const int section_len = hi - lo;
-      cumsum = hi;
-      
-      const int64_t pos = positions[s * num_tokens + token_idx];
-      const scalar_t* src = cos_sin_cache + pos * rot_dim;
-      
-      // Distribute the reads across all available threads in the block
-      for (int r = local_id; r < section_len; r += local_range) {
-        shared_cache[lo + r] = src[lo + r];                          // cos slice
-        shared_cache[embed_dim + lo + r] = src[embed_dim + lo + r];  // sin slice
-      }
+        if (dim_idx < cumsum + mrope_section[s]) {
+            section_idx = s;
+            section_offset = dim_idx - cumsum;
+            break;
+        }
+        cumsum += mrope_section[s];
     }
-    
-    // Wait for the SLM to be fully populated by ALL threads
-    item_ct1.barrier(sycl::access::fence_space::local_space);
 
-    const scalar_t* cache_ptr = &shared_cache[0];
+    const int64_t pos = positions[section_idx * num_tokens + token_idx];
 
-    apply_rotary_embedding<scalar_t, IS_NEOX>(
-        query,
-        key,
-        cache_ptr,
-        head_size,
-        num_heads,
-        num_kv_heads,
-        rot_dim,
-        token_idx,
-        query_stride,
-        key_stride,
-        head_stride,
-        item_ct1);
+    // 2. Fetch the cos and sin components
+    const vec_t cos_vec = *reinterpret_cast<const vec_t*>(&cos_sin_cache[pos * rot_dim + cumsum + section_offset]);
+    const vec_t sin_vec = *reinterpret_cast<const vec_t*>(&cos_sin_cache[pos * rot_dim + embed_dim + cumsum + section_offset]);
+
+    // 3. Loop over heads
+    for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
+        const int64_t q_offset = token_idx * query_stride + head_idx * head_stride;
+
+        if constexpr (IS_NEOX) {
+            vec_t q1 = *reinterpret_cast<const vec_t*>(&query[q_offset + dim_idx]);
+            vec_t q2 = *reinterpret_cast<const vec_t*>(&query[q_offset + embed_dim + dim_idx]);
+
+            vec_t out_q1, out_q2;
+            #pragma unroll
+            for (int v = 0; v < VEC_SIZE; ++v) {
+                out_q1[v] = q1[v] * cos_vec[v] - q2[v] * sin_vec[v];
+                out_q2[v] = q2[v] * cos_vec[v] + q1[v] * sin_vec[v];
+            }
+            *reinterpret_cast<vec_t*>(&query[q_offset + dim_idx]) = out_q1;
+            *reinterpret_cast<vec_t*>(&query[q_offset + embed_dim + dim_idx]) = out_q2;
+        } else {
+            #pragma unroll
+            for (int v = 0; v < VEC_SIZE; ++v) {
+                vec_t q_pair = *reinterpret_cast<const vec_t*>(&query[q_offset + (dim_idx + v) * 2]);
+                vec_t out_q;
+
+                out_q[0] = q_pair[0] * cos_vec[v] - q_pair[1] * sin_vec[v];
+                out_q[1] = q_pair[1] * cos_vec[v] + q_pair[0] * sin_vec[v];
+
+                *reinterpret_cast<vec_t*>(&query[q_offset + (dim_idx + v) * 2]) = out_q;
+            }
+        }
+    }
+
+    if (key != nullptr) {
+        for (int head_idx = 0; head_idx < num_kv_heads; ++head_idx) {
+            const int64_t k_offset = token_idx * key_stride + head_idx * head_stride;
+
+            if constexpr (IS_NEOX) {
+                vec_t k1 = *reinterpret_cast<const vec_t*>(&key[k_offset + dim_idx]);
+                vec_t k2 = *reinterpret_cast<const vec_t*>(&key[k_offset + embed_dim + dim_idx]);
+
+                vec_t out_k1, out_k2;
+                #pragma unroll
+                for (int v = 0; v < VEC_SIZE; ++v) {
+                    out_k1[v] = k1[v] * cos_vec[v] - k2[v] * sin_vec[v];
+                    out_k2[v] = k2[v] * cos_vec[v] + k1[v] * sin_vec[v];
+                }
+                *reinterpret_cast<vec_t*>(&key[k_offset + dim_idx]) = out_k1;
+                *reinterpret_cast<vec_t*>(&key[k_offset + embed_dim + dim_idx]) = out_k2;
+            } else {
+                #pragma unroll
+                for (int v = 0; v < VEC_SIZE; ++v) {
+                    vec_t k_pair = *reinterpret_cast<const vec_t*>(&key[k_offset + (dim_idx + v) * 2]);
+                    vec_t out_k;
+
+                    out_k[0] = k_pair[0] * cos_vec[v] - k_pair[1] * sin_vec[v];
+                    out_k[1] = k_pair[1] * cos_vec[v] + k_pair[0] * sin_vec[v];
+
+                    *reinterpret_cast<vec_t*>(&key[k_offset + (dim_idx + v) * 2]) = out_k;
+                }
+            }
+        }
+    }
   }
 
  private:
@@ -102,7 +158,7 @@ class multimodal_rotary_embedding_kernel {
   scalar_t* __restrict__ query;
   scalar_t* __restrict__ key;
   const scalar_t* __restrict__ cos_sin_cache;
-  int mrope_section[MROPE_MAX_SECTIONS];  // embedded, copied from host list
+  int mrope_section[MROPE_MAX_SECTIONS];
   const int num_mrope_sections;
   const int num_tokens;
   const int rot_dim;
@@ -112,7 +168,7 @@ class multimodal_rotary_embedding_kernel {
   const int num_heads;
   const int num_kv_heads;
   const int head_size;
-  sycl::local_accessor<scalar_t, 1> shared_cache;
+  const int tokens_per_block;
 };
 
 }  // namespace vllm
@@ -201,14 +257,20 @@ void call_multimodal_rotary_embedding_kernel(
       "), but got ",
       section_sum);
 
-  sycl::range<3> grid(1, 1, num_tokens);
-  sycl::range<3> block(1, 1, std::min<int64_t>(num_heads * rot_dim / 2, 512));
+  // Chunking tokens to saturate SIMD occupancy and reduce dispatch overhead
+  const int VEC_SIZE = 2;
+  const int num_vec_dims = (rot_dim / 2) / VEC_SIZE;
+  const int target_threads_per_block = 256;
+  int tokens_per_block = std::max(1, target_threads_per_block / num_vec_dims);
+
+  sycl::range<3> block(1, 1, tokens_per_block * num_vec_dims);
+  sycl::range<3> grid(1, 1, (num_tokens + tokens_per_block - 1) / tokens_per_block);
 
   at::DeviceGuard device_guard(query.device());
   auto& queue = vllm::xpu::vllmGetQueue();
+
   if (is_neox) {
     queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<sycl_t, 1> shared_cache(sycl::range<1>(rot_dim), cgh);
       cgh.parallel_for(
           sycl::nd_range<3>(grid * block, block),
           vllm::multimodal_rotary_embedding_kernel<sycl_t, true>(
@@ -226,11 +288,10 @@ void call_multimodal_rotary_embedding_kernel(
               num_heads,
               num_kv_heads,
               head_size,
-              shared_cache));
+              tokens_per_block));
     });
   } else {
     queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<sycl_t, 1> shared_cache(sycl::range<1>(rot_dim), cgh);
       cgh.parallel_for(
           sycl::nd_range<3>(grid * block, block),
           vllm::multimodal_rotary_embedding_kernel<sycl_t, false>(
@@ -248,7 +309,7 @@ void call_multimodal_rotary_embedding_kernel(
               num_heads,
               num_kv_heads,
               head_size,
-              shared_cache));
+              tokens_per_block));
     });
   }
 }
@@ -273,4 +334,3 @@ void multimodal_rotary_embedding(
             is_neox,
             mrope_section);
       });
-}
