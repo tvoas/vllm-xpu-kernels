@@ -10,18 +10,27 @@ import time
 import os
 import pytest
 import torch
+import statistics
 from collections import defaultdict
 
 import tests.register_ops as ops  # noqa: F401 – ensure custom ops are loaded
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 CSV_FILENAME = "test_mrope.csv"
+_CACHE_FLUSH_TENSOR = None
+
+def _flush_cache(device: str):
+    """Allocates/Zeros a 256MB tensor to force L2 Cache eviction."""
+    global _CACHE_FLUSH_TENSOR
+    if _CACHE_FLUSH_TENSOR is None or _CACHE_FLUSH_TENSOR.device.type != device:
+        _CACHE_FLUSH_TENSOR = torch.empty(int(256 * 1024 * 1024 // 4), dtype=torch.int32, device=device)
+    _CACHE_FLUSH_TENSOR.zero_()
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_csv():
     categories = [
-        "dtype", "num_tokens", "num_sections", "num_heads", "num_kv_heads", 
-        "head_size", "rot_dim", "is_neox_style", "use_key", 
+        "dtype", "num_tokens", "num_sections", "num_heads", "num_kv_heads",
+        "head_size", "rot_dim", "is_neox_style", "use_key",
         "use_triton_as_native", "include_python_framing"
     ]
 
@@ -135,7 +144,7 @@ MINI_PYTEST_PARAMS = {
     [
         # Real-world M-RoPE: Qwen2-VL 7B (GQA, rot=head, VEC_SIZE=4 valid)
         (28, 4, 128, 128, [16, 24, 24]),
-        
+
         # Real-world M-RoPE: Qwen2-VL 2B (MHA, rot=head, VEC_SIZE=4 valid)
         (32, 32, 128, 128, [16, 24, 24]),
 
@@ -192,8 +201,9 @@ def test_multimodal_rotary_embedding(dtype, device, is_neox_style, use_key, num_
     ])
 
     # vLLM explicitly uses flattened queries and keys for the standard interface
-    query = torch.randn(num_tokens, num_heads * head_size, dtype=dtype, device=device)
-    key = torch.randn(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device) if use_key else None
+    # Multiplied by 0.1 to avoid Inf/NaN degradation through repeated benchmark passes
+    query = torch.randn(num_tokens, num_heads * head_size, dtype=dtype, device=device) * 0.1
+    key = torch.randn(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device) * 0.1 if use_key else None
 
     # Track metrics mapped by variant
     timings = {}
@@ -222,55 +232,74 @@ def test_multimodal_rotary_embedding(dtype, device, is_neox_style, use_key, num_
             torch.testing.assert_close(out_k.cpu().float(), ref_k.float(), atol=atol, rtol=rtol)
 
         # 2. Benchmarking helper
-        def bench_fn(fn, warmup=100, iters=300):
-            for _ in range(warmup): fn()
+        def bench_fn(func, warmup=20, iters=100):
+            # Warm up
+            for _ in range(warmup):
+                q, k = query.clone(), (key.clone() if key is not None else None)
+                func(q, k)
             torch.xpu.synchronize()
-            start_time = time.perf_counter()
-            for _ in range(iters): fn()
-            torch.xpu.synchronize()
-            return (time.perf_counter() - start_time) / iters
+
+            times = []
+            for _ in range(iters):
+                q, k = query.clone(), (key.clone() if key is not None else None)
+
+                # Flush cache to get real VRAM bandwidth without L2 hits
+                _flush_cache(device)
+                torch.xpu.synchronize()
+
+                start_time = time.perf_counter()
+                func(q, k)
+                torch.xpu.synchronize()
+                times.append(time.perf_counter() - start_time)
+
+            return statistics.median(times)
 
         # Custom Kernel (Framed)
-        timings["custom_framed"] = bench_fn(lambda: mrope_layer.forward_xpu(positions, xpu_q, xpu_k), warmup=100, iters=1000)
+        timings["custom_framed"] = bench_fn(
+            lambda q, k: mrope_layer.forward_xpu(positions, q, k)
+        )
 
         # Custom Kernel (Pure)
-        q_view = xpu_q.view(num_tokens, num_heads, head_size)
-        k_view = xpu_k.view(num_tokens, num_kv_heads, head_size) if xpu_k is not None else None
-        timings["custom_pure"] = bench_fn(lambda: ops.multimodal_rotary_embedding(
-            positions, q_view, k_view, head_size, cos_sin_cache, is_neox_style, mrope_section
-        ), warmup=100, iters=1000)
+        timings["custom_pure"] = bench_fn(
+            lambda q, k: ops.multimodal_rotary_embedding(
+                positions,
+                q.view(num_tokens, num_heads, head_size),
+                k.view(num_tokens, num_kv_heads, head_size) if k is not None else None,
+                head_size, cos_sin_cache, is_neox_style, mrope_section
+            )
+        )
 
         # Baseline Benchmark (Torch Native)
-        q_ref = query.clone()
-        k_ref_bench = key.clone() if key is not None else torch.zeros(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device)
-        timings["torch"] = bench_fn(lambda: mrope_layer.forward_native(positions, q_ref, k_ref_bench))
+        dummy_k_ref_bench = torch.zeros(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device)
+        timings["torch"] = bench_fn(
+            lambda q, k: mrope_layer.forward_native(positions, q, k if use_key else dummy_k_ref_bench)
+        )
 
-        # Baseline Benchmark (Triton) - Triton is hardcoded for exactly 3 sections.
+        # Baseline Benchmark (Triton)
         if num_sections == 3:
-            timings["triton"] = bench_fn(lambda: mrope_layer.forward_cuda(positions, q_ref, k_ref_bench))
+            timings["triton"] = bench_fn(
+                lambda q, k: mrope_layer.forward_cuda(positions, q, k if use_key else dummy_k_ref_bench)
+            )
 
         status = "PASS"
     except Exception as e:
         status = f"FAIL: {str(e)}"
 
     finally:
-        # Common metric factors
-        # RoPE only reads/writes the rot_dim elements, NOT the whole head_size
-        accessed_q = num_tokens * num_heads * rot_dim
-        accessed_k = (num_tokens * num_kv_heads * rot_dim) if use_key else 0
-        
-        # 2x multiplier for Read + Write
-        total_bytes = (2 * accessed_q + 2 * accessed_k) * query.element_size()
-        
-        # Add positions read
-        total_bytes += positions.numel() * positions.element_size()
+        elem_bytes = query.element_size()
+        actual_num_kv_heads = num_kv_heads if use_key else 0
 
-        # Add cos/sin cache reads (rot_dim elements per token)
-        total_bytes += num_tokens * rot_dim * cos_sin_cache.element_size()
+        # Bandwidth model:
+        # RoPE only reads/writes `rot_dim` out of the full `head_size`
+        qk_bytes = 2 * num_tokens * (num_heads + actual_num_kv_heads) * rot_dim * elem_bytes
+        # Read cos/sin cache
+        cache_bytes = num_sections * num_tokens * rot_dim * cos_sin_cache.element_size()
+        # Read positions
+        pos_bytes = num_sections * num_tokens * 8  # int64
+        total_bytes = qk_bytes + cache_bytes + pos_bytes
 
-        total_flops = 4 * (num_tokens * num_heads * rot_dim)
-        if use_key:
-            total_flops += 4 * (num_tokens * num_kv_heads * rot_dim)
+        # FLOP model (6 FLOPs per pair -> 3 FLOPs per scalar component)
+        total_flops = 6.0 * num_tokens * (num_heads + actual_num_kv_heads) * (rot_dim // 2)
 
         # Report combinations
         triton_opts = [True, False] if num_sections == 3 else [False]
@@ -298,8 +327,8 @@ def test_multimodal_rotary_embedding(dtype, device, is_neox_style, use_key, num_
                               f"Speedup: {speedup:.2f}x")
 
                         writer.writerow([
-                            str(dtype).split('.')[-1], num_tokens, num_sections, num_heads, num_kv_heads, 
-                            head_size, rot_dim, is_neox_style, use_key, use_triton_as_native, 
+                            str(dtype).split('.')[-1], num_tokens, num_sections, num_heads, num_kv_heads,
+                            head_size, rot_dim, is_neox_style, use_key, use_triton_as_native,
                             include_python_framing, status,
                             c_time * 1e6, c_bw, c_tf,
                             b_time * 1e6, b_bw, b_tf, speedup
@@ -307,8 +336,8 @@ def test_multimodal_rotary_embedding(dtype, device, is_neox_style, use_key, num_
                     else:
                         print(f"\n[M-RoPE {dtype}] Toks={num_tokens} QHeads={num_heads} KVHeads={num_kv_heads} Head={head_size} RotD={rot_dim} Sec={num_sections} has_K={use_key} Neox={is_neox_style} Include Python Frame={include_python_framing} | {status}")
                         writer.writerow([
-                            str(dtype).split('.')[-1], num_tokens, num_sections, num_heads, num_kv_heads, 
-                            head_size, rot_dim, is_neox_style, use_key, use_triton_as_native, 
+                            str(dtype).split('.')[-1], num_tokens, num_sections, num_heads, num_kv_heads,
+                            head_size, rot_dim, is_neox_style, use_key, use_triton_as_native,
                             include_python_framing, "FAIL",
                             0, 0, 0, 0, 0, 0, 0
                         ])

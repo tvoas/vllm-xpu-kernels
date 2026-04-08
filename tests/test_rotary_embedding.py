@@ -9,6 +9,7 @@ import pytest
 import torch
 import csv
 import os
+import statistics
 
 from tests.ops.rotary_embedding_op import RotaryEmbedding
 from tests.utils import opcheck
@@ -18,6 +19,14 @@ from collections import defaultdict
 torch.manual_seed(42)
 
 CSV_FILENAME = "test_rotary_embedding.csv"
+_CACHE_FLUSH_TENSOR = None
+
+def _flush_cache(device: str):
+    """Allocates/Zeros a 256MB tensor to force L2 Cache eviction."""
+    global _CACHE_FLUSH_TENSOR
+    if _CACHE_FLUSH_TENSOR is None or _CACHE_FLUSH_TENSOR.device.type != device:
+        _CACHE_FLUSH_TENSOR = torch.empty(int(256 * 1024 * 1024 // 4), dtype=torch.int32, device=device)
+    _CACHE_FLUSH_TENSOR.zero_()
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_csv():
@@ -213,46 +222,57 @@ def test_rotary_embedding_accuracy_and_benchmark(
             is_neox_style
         ))
 
-        def bench_fn(fn, warmup=100, iters=300):
-            for _ in range(warmup): fn()
+        def bench_fn(func, warmup=20, iters=100):
+            # Warm up
+            for _ in range(warmup):
+                q, k = query.clone(), (key.clone() if key is not None else None)
+                func(q, k)
             torch.xpu.synchronize()
-            start_time = time.perf_counter()
-            for _ in range(iters): fn()
-            torch.xpu.synchronize()
-            return (time.perf_counter() - start_time) / iters
+
+            times = []
+            for _ in range(iters):
+                q, k = query.clone(), (key.clone() if key is not None else None)
+
+                # Flush cache to get real VRAM bandwidth without L2 hits
+                _flush_cache(device)
+                torch.xpu.synchronize()
+
+                start_time = time.perf_counter()
+                func(q, k)
+                torch.xpu.synchronize()
+                times.append(time.perf_counter() - start_time)
+
+            return statistics.median(times)
 
         # Custom Kernel Benchmark
-        q_bench = query.clone()
-        k_bench = key.clone() if key is not None else None
         custom_time_s = bench_fn(
-            lambda: torch.ops._C.rotary_embedding(positions, q_bench, k_bench, head_size, cos_sin_cache, is_neox_style),
-            warmup=100, iters=1000
+            lambda q, k: torch.ops._C.rotary_embedding(positions, q, k, head_size, cos_sin_cache, is_neox_style),
+            warmup=20, iters=100
         )
 
         # Baseline Benchmark (Torch Native)
-        query_pt = query.clone()
-        key_pt = key.clone() if key is not None else None
         torch_time_s = bench_fn(
-            lambda: benchmark_pytorch_native_rope(positions, query_pt, key_pt, cos_sin_cache, is_neox_style),
-            warmup=10, iters=20
+            lambda q, k: benchmark_pytorch_native_rope(positions, q, k, cos_sin_cache, is_neox_style),
+            warmup=5, iters=15
         )
         
         # BW and FLOPs Calculation Alignment
-        accessed_q = batch_size * seq_len * num_heads * rotary_dim
-        accessed_k = (batch_size * seq_len * num_kv_heads * rotary_dim) if use_key else 0
+        elem_bytes = query.element_size()
+        actual_num_kv_heads = num_kv_heads if use_key else 0
+        num_tokens = batch_size * seq_len
+
+        # Bandwidth model:
+        # RoPE only reads/writes `rot_dim` out of the full `head_size`
+        qk_bytes = 2 * num_tokens * (num_heads + actual_num_kv_heads) * rotary_dim * elem_bytes
+        # Read cos/sin cache
+        cache_bytes = num_tokens * rotary_dim * cos_sin_cache.element_size()
+        # Read positions
+        pos_bytes = num_tokens * 8  # int64 positions
         
-        # 2x multiplier for Read + Write the rotated elements
-        total_bytes = (2 * accessed_q + 2 * accessed_k) * query.element_size()
+        total_bytes = qk_bytes + cache_bytes + pos_bytes
         
-        # Add positions read
-        total_bytes += positions.numel() * positions.element_size()
-        
-        # Add cos/sin cache reads (rot_dim elements per token)
-        total_bytes += (batch_size * seq_len) * rotary_dim * cos_sin_cache.element_size()
-        
-        total_flops = 4 * (batch_size * seq_len * num_heads * rotary_dim)
-        if use_key:
-            total_flops += 4 * (batch_size * seq_len * num_kv_heads * rotary_dim)
+        # FLOP model (6 FLOPs per pair -> 3 FLOPs per scalar component)
+        total_flops = 6.0 * num_tokens * (num_heads + actual_num_kv_heads) * (rotary_dim // 2)
 
         custom_bw = (total_bytes / 1e9) / custom_time_s
         custom_tflops = (total_flops / 1e12) / custom_time_s
