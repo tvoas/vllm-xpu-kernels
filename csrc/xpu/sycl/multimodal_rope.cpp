@@ -334,3 +334,4 @@ void multimodal_rotary_embedding(
             is_neox,
             mrope_section);
       });
+}
