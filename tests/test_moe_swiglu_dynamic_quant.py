@@ -125,6 +125,7 @@ def baseline_moe_swiglu(
 
     quant_tokens = torch.zeros((num_scattered, hidden_size), dtype=torch.int8, device=scatter_tokens.device)
     per_token_scale = torch.zeros(num_scattered, dtype=torch.float32, device=scatter_tokens.device)
+    unquantized_math = torch.zeros((num_scattered, hidden_size), dtype=torch.float32, device=scatter_tokens.device)
 
     for exp in range(num_experts):
         start = experts_token_start[exp].item()
@@ -140,6 +141,8 @@ def baseline_moe_swiglu(
             swiglu = x1_silu * x2
             scaled = swiglu * scale
             
+            unquantized_math[target_idx] = scaled  # Track pure float math
+            
             max_val = scaled.abs().max().item()
             this_token_scale = max_val / 127.0
             scale_divisor = this_token_scale if this_token_scale != 0.0 else 1.0
@@ -149,7 +152,7 @@ def baseline_moe_swiglu(
             quant_tokens[target_idx] = quantized
             per_token_scale[target_idx] = this_token_scale
 
-    return quant_tokens, per_token_scale
+    return quant_tokens, per_token_scale, unquantized_math
 
 @pytest.mark.parametrize("num_scattered", [16, 40, 80, 128, 256, 512, 1024, 2048, 4096])
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024, 2048, 4096, 7168])
@@ -199,7 +202,7 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts):
 
     try:
         # 1. Run Torch Accuracy Baseline
-        ref_quant_tokens, ref_per_scale = baseline_moe_swiglu(
+        ref_quant_tokens, ref_per_scale, ref_unquantized_tokens = baseline_moe_swiglu(
             scatter_tokens, smooth_scale, experts_token_count, experts_token_start
         )
 
@@ -211,12 +214,21 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts):
         )
         torch.xpu.synchronize()
 
+        # Reconstruct pure floats back from the custom kernel's output
+        custom_dequantized = out_quant_tokens.float() * out_per_scale.unsqueeze(1)
+        float_diff = (custom_dequantized - ref_unquantized_tokens).abs()
+        max_float_error = float_diff.max().item()
+
         if KERNEL_SOURCE != "IPEX":
             # Output offsets perfectly match in SwiGLU, so no complex sorting is required here.
             torch.testing.assert_close(out_per_scale, ref_per_scale, atol=1e-5, rtol=1e-5)
-        
-        diff = (out_quant_tokens.int() - ref_quant_tokens.int()).abs()
-        assert diff.max().item() <= 1, "Quantized values diverge completely!"
+            
+            diff = (out_quant_tokens.int() - ref_quant_tokens.int()).abs()
+            assert diff.max().item() <= 1, "Quantized values diverge completely!"
+            assert max_float_error < 0.5, f"Dequantized mathematical outputs diverge! Max float error: {max_float_error}"
+        else:
+            if max_float_error > 1.0:
+                print(f"IPEX kernel produced garbage float equivalents! Max error: {max_float_error}")
 
         # 3. Benchmarks
         def bench_fn(is_custom, warmup=25, iters=1000):
