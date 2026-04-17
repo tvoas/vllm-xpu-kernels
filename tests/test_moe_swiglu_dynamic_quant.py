@@ -158,8 +158,8 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts):
     device = "xpu"
     dtype = torch.bfloat16
 
-    if num_scattered % num_experts != 0:
-        pytest.skip(f"num_scattered ({num_scattered}) must be a multiple of num_experts ({num_experts}) to avoid IPEX C++ FPE crashes.")
+    #if num_scattered % num_experts != 0:
+    #    pytest.skip(f"num_scattered ({num_scattered}) must be a multiple of num_experts ({num_experts}) to avoid IPEX C++ FPE crashes.")
     if KERNEL_SOURCE == "IPEX" and hidden_size < 256:
         pytest.skip("IPEX kernel does not support hidden_size < 256.")
 
