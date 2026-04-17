@@ -49,8 +49,10 @@ void moe_swiglu_dynamic_quant(
 
             const int bid = item.get_local_id(2);
             if (bid == 0) {
-                simd<float, MAX_BN> zeros = 0.0f;
-                slm_block_store<float, MAX_BN>(0, zeros);
+                // Safely split the 128-wide initialization into two 64-wide instructions
+                simd<float, 64> zeros = 0.0f;
+                slm_block_store<float, 64>(0, zeros);
+                slm_block_store<float, 64>(64 * sizeof(float), zeros);
             }
             barrier();
 
@@ -87,11 +89,19 @@ void moe_swiglu_dynamic_quant(
 
             barrier();
 
-            simd<float, MAX_BN> max_value_full = slm_block_load<float, MAX_BN>(0);
-            float max_value_final = hmax<float, float, MAX_BN>(max_value_full);
+            // Safely split the 128-wide SLM load and max-reduction
+            simd<float, 64> max_value_p1 = slm_block_load<float, 64>(0);
+            simd<float, 64> max_value_p2 = slm_block_load<float, 64>(64 * sizeof(float));
+            
+            float max_final_p1 = hmax<float, float, 64>(max_value_p1);
+            float max_final_p2 = hmax<float, float, 64>(max_value_p2);
+            float max_value_final = std::max(max_final_p1, max_final_p2);
+            
             float this_token_scale = max_value_final / 127.0f;
+            float recip_scale = this_token_scale == 0.0f ? 1.0f : (1.0f / this_token_scale);
 
-            simd<float, BS> scaled_swiglu_tokens_quant = rnde<float>(scaled_swiglu_tokens / (this_token_scale == 0 ? 1.0f : this_token_scale));
+            // Use the faster reciprocal multiplication instead of vector division
+            simd<float, BS> scaled_swiglu_tokens_quant = rnde<float>(scaled_swiglu_tokens * recip_scale);
             simd<int8_t, BS> scaled_swiglu_tokens_quant_out = scaled_swiglu_tokens_quant;
 
             block_store<int8_t, BS>(
