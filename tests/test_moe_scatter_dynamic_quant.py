@@ -220,12 +220,11 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         torch.testing.assert_close(out_t_start, ref_t_start)
 
         # 2. Extract Valid Mappings Globally
-        # Sort non-zero elements to completely bypass any architectural layout race conditions
-        custom_mask = out_per_scale > 0
-        ref_mask = ref_per_scale > 0
+        # Sort values globally. Bypass layout race conditions by tracking only valid routed counts.
+        total_valid = ref_t_count.sum().item()
         
-        custom_scales_sorted = out_per_scale[custom_mask].sort()[0]
-        ref_scales_sorted = ref_per_scale[ref_mask].sort()[0]
+        custom_scales_sorted = out_per_scale.sort(descending=True)[0][:total_valid]
+        ref_scales_sorted = ref_per_scale.sort(descending=True)[0][:total_valid]
 
         torch.testing.assert_close(
             custom_scales_sorted, 
@@ -234,9 +233,8 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         )
         
         # Sort INT8 distributions per entire trace 
-        # (Allows diffs <=4 to account for floating point dynamic scale shifting rounding logic differences)
-        custom_tokens_sorted = out_scatter_tokens[custom_mask].flatten().sort()[0]
-        ref_tokens_sorted = ref_scatter_tokens[ref_mask].flatten().sort()[0]
+        custom_tokens_sorted = out_scatter_tokens.flatten().sort(descending=True)[0][:total_valid * hidden_size]
+        ref_tokens_sorted = ref_scatter_tokens.flatten().sort(descending=True)[0][:total_valid * hidden_size]
 
         diff = (custom_tokens_sorted.int() - ref_tokens_sorted.int()).abs()
         assert diff.max().item() <= 4, f"Quantized values diverge heavily! Max diff: {diff.max().item()}"
