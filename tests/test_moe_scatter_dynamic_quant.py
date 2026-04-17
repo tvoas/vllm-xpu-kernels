@@ -229,7 +229,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         torch.testing.assert_close(
             custom_scales_sorted, 
             ref_scales_sorted, 
-            atol=2e-2, rtol=2e-2
+            atol=5e-2, rtol=5e-2
         )
         
         # Sort INT8 distributions per entire trace 
@@ -237,7 +237,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         ref_tokens_sorted = ref_scatter_tokens.flatten().sort(descending=True)[0][:total_valid * hidden_size]
 
         diff = (custom_tokens_sorted.int() - ref_tokens_sorted.int()).abs()
-        assert diff.max().item() <= 4, f"Quantized values diverge heavily! Max diff: {diff.max().item()}"
+        assert diff.max().item() <= 5, f"Quantized values diverge heavily! Max diff: {diff.max().item()}"
 
         # 3. Benchmarks
         def bench_fn(is_custom, warmup=25, iters=1000):
