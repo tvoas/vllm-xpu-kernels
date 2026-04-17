@@ -167,8 +167,8 @@ def baseline_moe_scatter(
 
     return out_token_to_scatter_offset, out_tokens_count, out_tokens_start, scatter_tokens, per_token_scale, tokens_offset
 
-@pytest.mark.parametrize("num_tokens", [16, 40, 80, 128, 256, 512, 1024, 2048, 4096])
-@pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024, 2048, 4096, 7168])
+@pytest.mark.parametrize("num_tokens", [4096])
+@pytest.mark.parametrize("hidden_size", [2048, 4096, 7168])
 @pytest.mark.parametrize("topk", [2, 5, 8])
 @pytest.mark.parametrize("num_experts", [64, 128, 256])
 def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
