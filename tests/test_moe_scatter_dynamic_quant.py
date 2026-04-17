@@ -167,8 +167,8 @@ def baseline_moe_scatter(
 
     return out_token_to_scatter_offset, out_tokens_count, out_tokens_start, scatter_tokens, per_token_scale, tokens_offset
 
-@pytest.mark.parametrize("num_tokens", [4096])
-@pytest.mark.parametrize("hidden_size", [2048, 4096, 7168])
+@pytest.mark.parametrize("num_tokens", [16, 40, 80, 128, 256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024, 2048, 4096, 7168])
 @pytest.mark.parametrize("topk", [2, 5, 8])
 @pytest.mark.parametrize("num_experts", [64, 128, 256])
 def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
@@ -219,29 +219,30 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         torch.testing.assert_close(out_t_count, ref_t_count)
         torch.testing.assert_close(out_t_start, ref_t_start)
 
-        # 2. Direct 1:1 Mapping
-        # Extract the exact destination row for every (token, topk) combination using the kernel's own routing metadata
-        flat_experts = selected_experts.long()
-        
-        # Where Pytorch put them
-        ref_indices = ref_t_start[flat_experts] + ref_t_offset
-        # Where the Custom Kernel put them
-        custom_indices = out_t_start[flat_experts] + out_t_offset
+        # Build an explicit array representing which Expert ID owns which output row
+        expert_ids = torch.zeros(num_tokens * topk, dtype=torch.int64, device=device)
+        for i in range(num_experts):
+            start = ref_t_start[i].item()
+            count = ref_t_count[i].item()
+            if count > 0:
+                expert_ids[start:start+count] = i
 
-        # Validate Scales
-        torch.testing.assert_close(
-            out_per_scale[custom_indices], 
-            ref_per_scale[ref_indices], 
-            atol=5e-2, rtol=5e-2
-        )
-        
-        # Validate INT8 Quantized Math
-        diff = (out_scatter_tokens[custom_indices].int() - ref_scatter_tokens[ref_indices].int()).abs()
-        
-        # Allow an absolute difference of <= 5 due to hardware transcendental/accumulation variances in the scale finding
-        assert diff.max().item() <= 5, f"Quantized mathematical outputs diverge! Max diff: {diff.max().item()}"
+        # Sort strictly by (Expert ID, Original Token Index)
+        # Using num_tokens as the multiplier guarantees no overlap since offsets < num_tokens
+        sort_key_custom = (expert_ids * num_tokens) + out_tokens_offset
+        sort_key_ref = (expert_ids * num_tokens) + ref_tokens_offset
 
-        # 3. Benchmarks
+        sort_idx_custom = torch.argsort(sort_key_custom)
+        sort_idx_ref = torch.argsort(sort_key_ref)
+
+        if KERNEL_SOURCE != "IPEX":
+            torch.testing.assert_close(out_tokens_offset[sort_idx_custom], ref_tokens_offset[sort_idx_ref])
+            torch.testing.assert_close(out_per_scale[sort_idx_custom], ref_per_scale[sort_idx_ref], atol=1e-5, rtol=1e-5)
+            
+            diff = (out_scatter_tokens[sort_idx_custom].int() - ref_scatter_tokens[sort_idx_ref].int()).abs()
+            assert diff.max().item() <= 1, "Quantized values diverge completely!"
+
+        # 2. Benchmarks
         def bench_fn(is_custom, warmup=25, iters=1000):
             # Warm up
             for _ in range(warmup): 
@@ -280,8 +281,12 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         custom_time_s = bench_fn(is_custom=True)
         torch_time_s = bench_fn(is_custom=False, warmup=2, iters=5)
 
-        # 4. Metrics
-        total_bytes = (num_tokens * hidden_size * 2) + (num_experts * hidden_size * 4) + (num_tokens * topk * 4) + (num_tokens * topk * hidden_size * 1)
+        # 3. Metrics
+        # Bytes: hidden_states (bf16), smooth_scale (fp32), moe_weights (fp32), scatter_tokens (int8)
+        total_bytes = (num_tokens * hidden_size * 2) + \
+                      (num_experts * hidden_size * 4) + \
+                      (num_tokens * topk * 4) + \
+                      (num_tokens * topk * hidden_size * 1)
         total_flops = num_tokens * topk * hidden_size * 2
 
         custom_bw = (total_bytes / 1e9) / custom_time_s

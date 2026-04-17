@@ -136,7 +136,7 @@ def baseline_moe_swiglu(
             x2 = scatter_tokens[target_idx, hidden_size:].float()
             scale = smooth_scale[exp].float()
 
-            x1_silu = x1 / (1.0 + torch.exp(-x1))
+            x1_silu = torch.nn.functional.silu(x1)
             swiglu = x1_silu * x2
             scaled = swiglu * scale
             
@@ -158,8 +158,6 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts):
     device = "xpu"
     dtype = torch.bfloat16
 
-    #if num_scattered % num_experts != 0:
-    #    pytest.skip(f"num_scattered ({num_scattered}) must be a multiple of num_experts ({num_experts}) to avoid IPEX C++ FPE crashes.")
     if KERNEL_SOURCE == "IPEX" and hidden_size < 256:
         pytest.skip("IPEX kernel does not support hidden_size < 256.")
 
@@ -213,11 +211,12 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts):
         )
         torch.xpu.synchronize()
 
-        # Output offsets perfectly match in SwiGLU, so no complex sorting is required here.
-        torch.testing.assert_close(out_per_scale, ref_per_scale, atol=1e-4, rtol=1e-4)
+        if KERNEL_SOURCE != "IPEX":
+            # Output offsets perfectly match in SwiGLU, so no complex sorting is required here.
+            torch.testing.assert_close(out_per_scale, ref_per_scale, atol=1e-5, rtol=1e-5)
         
         diff = (out_quant_tokens.int() - ref_quant_tokens.int()).abs()
-        assert diff.max().item() <= 2, f"Quantized values diverge completely! Max diff: {diff.max().item()}"
+        assert diff.max().item() <= 1, "Quantized values diverge completely!"
 
         # 3. Benchmarks
         def bench_fn(is_custom, warmup=25, iters=1000):
