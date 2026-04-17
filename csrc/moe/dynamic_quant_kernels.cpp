@@ -33,26 +33,23 @@ void moe_swiglu_dynamic_quant(
     int hidden_size = scatter_tokens.size(1) / 2;
 
     constexpr int BS = 64;
-    constexpr int MAX_BN = 128; 
     assert(hidden_size % BS == 0);
-    assert(hidden_size <= MAX_BN * BS);
 
     int nb = hidden_size / BS;
+    int wg_size = std::min(nb, 64); // Hard cap at MAX Hardware Workgroup Limit
 
-    sycl::range<3> GlobalRange(total_experts_num, max_token_num, nb);
-    sycl::range<3> LocalRange(1, 1, nb);
+    sycl::range<3> GlobalRange(total_experts_num, max_token_num, wg_size);
+    sycl::range<3> LocalRange(1, 1, wg_size);
     sycl::nd_range<3> Range(GlobalRange, LocalRange);
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(Range, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
-            slm_init(MAX_BN * sizeof(float));
+            slm_init(64 * sizeof(float));
 
-            const int bid = item.get_local_id(2);
-            if (bid == 0) {
-                // Safely split the 128-wide initialization into two 64-wide instructions
+            const int loc_id = item.get_local_id(2);
+            if (loc_id == 0) {
                 simd<float, 64> zeros = 0.0f;
                 slm_block_store<float, 64>(0, zeros);
-                slm_block_store<float, 64>(64 * sizeof(float), zeros);
             }
             barrier();
 
@@ -65,49 +62,66 @@ void moe_swiglu_dynamic_quant(
             }
 
             const int token_start = experts_token_start_ptr[expert_idx];
-
             bf16* scatter_token_base = scatter_tokens_ptr + (token_start + token_idx) * 2 * hidden_size;
-            int8_t* output_base = quant_tokens_ptr + (token_start + token_idx) * hidden_size + bid * BS;
+            int8_t* output_base = quant_tokens_ptr + (token_start + token_idx) * hidden_size;
 
-            simd<bf16, BS> x1 = block_load<bf16, BS>(
-                scatter_token_base + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
-            simd<bf16, BS> x2 = block_load<bf16, BS>(
-                scatter_token_base + hidden_size + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
-            simd<float, BS> scale = block_load<float, BS>(
-                smooth_scale_ptr + expert_idx * hidden_size + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+            float thread_max = 0.0f;
 
-            simd<float, BS> x1_f = x1;
-            simd<float, BS> x2_f = x2;
-            
-            simd<float, BS> x1_silu = x1_f / (1 + sycl::ext::intel::esimd::exp(-x1_f));
-            simd<float, BS> swiglu_tokens = x1_silu * x2_f;
+            // FIRST SCAN: Compute max across all chunks this thread is responsible for
+            for (int bid = loc_id; bid < nb; bid += wg_size) {
+                simd<bf16, BS> x1 = block_load<bf16, BS>(
+                    scatter_token_base + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                simd<bf16, BS> x2 = block_load<bf16, BS>(
+                    scatter_token_base + hidden_size + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                simd<float, BS> scale = block_load<float, BS>(
+                    smooth_scale_ptr + expert_idx * hidden_size + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
 
-            simd<float, BS> scaled_swiglu_tokens = swiglu_tokens * scale;
-            simd<float, BS> scaled_swiglu_tokens_abs = sycl::ext::intel::esimd::abs(scaled_swiglu_tokens);
-            float max_value = hmax<float, float, BS>(scaled_swiglu_tokens_abs);
-            slm_block_store<float, 1>(bid * sizeof(float), max_value);
+                simd<float, BS> x1_f = x1;
+                simd<float, BS> x2_f = x2;
+                
+                simd<float, BS> x1_silu = x1_f / (1 + sycl::ext::intel::esimd::exp(-x1_f));
+                simd<float, BS> swiglu_tokens = x1_silu * x2_f;
 
+                simd<float, BS> scaled_swiglu_tokens = swiglu_tokens * scale;
+                simd<float, BS> scaled_swiglu_tokens_abs = sycl::ext::intel::esimd::abs(scaled_swiglu_tokens);
+                
+                float max_value = hmax<float, float, BS>(scaled_swiglu_tokens_abs);
+                thread_max = std::max(thread_max, max_value);
+            }
+
+            slm_block_store<float, 1>(loc_id * sizeof(float), thread_max);
             barrier();
 
-            // Safely split the 128-wide SLM load and max-reduction
-            simd<float, 64> max_value_p1 = slm_block_load<float, 64>(0);
-            simd<float, 64> max_value_p2 = slm_block_load<float, 64>(64 * sizeof(float));
-            
-            float max_final_p1 = hmax<float, float, 64>(max_value_p1);
-            float max_final_p2 = hmax<float, float, 64>(max_value_p2);
-            float max_value_final = std::max(max_final_p1, max_final_p2);
+            simd<float, 64> max_value_full = slm_block_load<float, 64>(0);
+            float max_value_final = hmax<float, float, 64>(max_value_full);
             
             float this_token_scale = max_value_final / 127.0f;
             float recip_scale = this_token_scale == 0.0f ? 1.0f : (1.0f / this_token_scale);
 
-            // Use the faster reciprocal multiplication instead of vector division
-            simd<float, BS> scaled_swiglu_tokens_quant = rnde<float>(scaled_swiglu_tokens * recip_scale);
-            simd<int8_t, BS> scaled_swiglu_tokens_quant_out = scaled_swiglu_tokens_quant;
+            // SECOND SCAN: Recompute, Quantize, and Store safely
+            for (int bid = loc_id; bid < nb; bid += wg_size) {
+                simd<bf16, BS> x1 = block_load<bf16, BS>(
+                    scatter_token_base + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                simd<bf16, BS> x2 = block_load<bf16, BS>(
+                    scatter_token_base + hidden_size + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                simd<float, BS> scale = block_load<float, BS>(
+                    smooth_scale_ptr + expert_idx * hidden_size + bid * BS, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
 
-            block_store<int8_t, BS>(
-                output_base, scaled_swiglu_tokens_quant_out, properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
+                simd<float, BS> x1_f = x1;
+                simd<float, BS> x2_f = x2;
+                
+                simd<float, BS> x1_silu = x1_f / (1 + sycl::ext::intel::esimd::exp(-x1_f));
+                simd<float, BS> swiglu_tokens = x1_silu * x2_f;
 
-            if (bid == 0) {
+                simd<float, BS> scaled_swiglu_tokens = swiglu_tokens * scale;
+                simd<float, BS> scaled_swiglu_tokens_quant = rnde<float>(scaled_swiglu_tokens * recip_scale);
+                simd<int8_t, BS> scaled_swiglu_tokens_quant_out = scaled_swiglu_tokens_quant;
+
+                block_store<int8_t, BS>(
+                    output_base + bid * BS, scaled_swiglu_tokens_quant_out, properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
+            }
+
+            if (loc_id == 0) {
                 block_store<float, 1>(
                     per_token_scale_ptr + token_start + token_idx, simd<float, 1>(this_token_scale), properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
             }
