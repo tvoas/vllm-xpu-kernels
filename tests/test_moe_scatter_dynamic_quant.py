@@ -11,6 +11,10 @@ try:
     import tests.register_ops as ops  # noqa: F401
 except ImportError:
     pass
+try:
+    import intel_extension_for_pytorch as ipex  # noqa: F401
+except ImportError:
+    pass
 
 torch.manual_seed(42)
 
