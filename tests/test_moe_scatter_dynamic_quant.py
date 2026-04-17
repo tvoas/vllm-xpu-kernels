@@ -6,12 +6,16 @@ import os
 import statistics
 from collections import defaultdict
 
-# Ensure extensions are registered
-import tests.register_ops as ops  # noqa: F401
+# Attempt to register ops if using vllm-xpu-kernels
+try:
+    import tests.register_ops as ops  # noqa: F401
+except ImportError:
+    pass
 
 torch.manual_seed(42)
 
 CSV_FILENAME = "test_moe_scatter_quant.csv"
+KERNEL_SOURCE = os.environ.get("KERNEL_SOURCE", "VLLM_XPU").upper()
 _CACHE_FLUSH_TENSOR = None
 
 def _flush_cache(device: str):
@@ -22,7 +26,7 @@ def _flush_cache(device: str):
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_csv():
-    categories = ["dtype", "num_tokens", "hidden_size", "topk", "num_experts"]
+    categories = ["kernel_source", "dtype", "num_tokens", "hidden_size", "topk", "num_experts"]
     
     with open(CSV_FILENAME, "w", newline="") as f:
         writer = csv.writer(f)
@@ -159,14 +163,23 @@ def baseline_moe_scatter(
 
     return out_token_to_scatter_offset, out_tokens_count, out_tokens_start, scatter_tokens, per_token_scale, tokens_offset
 
-@pytest.mark.parametrize("num_tokens", [16, 40, 80, 256, 1024, 4096])
-@pytest.mark.parametrize("hidden_size", [128, 4096, 7168])
+@pytest.mark.parametrize("num_tokens", [16, 40, 80, 128, 256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024, 2048, 4096, 7168])
 @pytest.mark.parametrize("topk", [2, 5, 8])
 @pytest.mark.parametrize("num_experts", [64, 128, 256])
 def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
     device = "xpu"
     dtype = torch.bfloat16
     shared_experts_num = 0
+
+    if KERNEL_SOURCE == "IPEX":
+        if not hasattr(torch.ops, "torch_ipex") or not hasattr(torch.ops.torch_ipex, "moe_scatter_dynamic_quant"):
+            pytest.skip("IPEX kernel not found.")
+        custom_op = torch.ops.torch_ipex.moe_scatter_dynamic_quant
+    else:
+        if not hasattr(torch.ops, "_moe_C") or not hasattr(torch.ops._moe_C, "moe_scatter_dynamic_quant"):
+            pytest.skip("vllm-xpu-kernels not found.")
+        custom_op = torch.ops._moe_C.moe_scatter_dynamic_quant
 
     selected_experts = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
     moe_weights = torch.rand((num_tokens, topk), dtype=torch.float32, device=device)
@@ -191,7 +204,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
              selected_experts, moe_weights, hidden_states, experts_smooth_scale, num_experts
         )
 
-        torch.ops._moe_C.moe_scatter_dynamic_quant(
+        custom_op(
             selected_experts, moe_weights, out_t_offset, out_t_count, out_t_start,
             hidden_states, experts_smooth_scale, out_scatter_tokens, out_per_scale, 
             out_tokens_offset, shared_experts_num
@@ -228,7 +241,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
             for _ in range(warmup): 
                 if is_custom:
                     out_t_count.zero_()
-                    torch.ops._moe_C.moe_scatter_dynamic_quant(
+                    custom_op(
                         selected_experts, moe_weights, out_t_offset, out_t_count, out_t_start,
                         hidden_states, experts_smooth_scale, out_scatter_tokens, out_per_scale, 
                         out_tokens_offset, shared_experts_num
@@ -246,7 +259,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
                 start_time = time.perf_counter()
                 if is_custom:
                     out_t_count.zero_()
-                    torch.ops._moe_C.moe_scatter_dynamic_quant(
+                    custom_op(
                         selected_experts, moe_weights, out_t_offset, out_t_count, out_t_start,
                         hidden_states, experts_smooth_scale, out_scatter_tokens, out_per_scale, 
                         out_tokens_offset, shared_experts_num
@@ -259,7 +272,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
             return statistics.median(times)
 
         custom_time_s = bench_fn(is_custom=True)
-        torch_time_s = bench_fn(is_custom=False, warmup=5, iters=15)
+        torch_time_s = bench_fn(is_custom=False, warmup=2, iters=5)
 
         # 3. Metrics
         # Bytes: hidden_states (bf16), smooth_scale (fp32), moe_weights (fp32), scatter_tokens (int8)
@@ -281,7 +294,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         raise e
     
     finally:
-        print(f"\n[Scatter Quant] Tok={num_tokens} Hid={hidden_size} TopK={topk} Exp={num_experts} | "
+        print(f"\n[Scatter Quant] Src={KERNEL_SOURCE} Tok={num_tokens} Hid={hidden_size} TopK={topk} Exp={num_experts} | "
               f"{status} | "
               f"Custom: {custom_time_s*1e6:.2f} us ({custom_bw:.2f} GB/s) | "
               f"Torch: {torch_time_s*1e6:.2f} us ({torch_bw:.2f} GB/s) | "
@@ -289,7 +302,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
 
         with open(CSV_FILENAME, "a", newline="") as f:
             csv.writer(f).writerow([
-                "bfloat16", num_tokens, hidden_size, topk, num_experts, status,
+                KERNEL_SOURCE, "bfloat16", num_tokens, hidden_size, topk, num_experts, status,
                 custom_time_s * 1e6, custom_bw, custom_tflops,
                 torch_time_s * 1e6, torch_bw, torch_tflops, speedup
             ])
