@@ -143,6 +143,9 @@ def baseline_moe_scatter(
     scatter_tokens = torch.zeros((num_tokens * topk, hidden_size), dtype=torch.int8, device=hidden_states.device)
     per_token_scale = torch.zeros(num_tokens * topk, dtype=torch.float32, device=hidden_states.device)
     tokens_offset = torch.zeros(num_tokens * topk, dtype=torch.int32, device=hidden_states.device)
+    
+    # Add a pure float tracker
+    unquantized_math = torch.zeros((num_tokens * topk, hidden_size), dtype=torch.float32, device=hidden_states.device)
 
     for t in range(num_tokens):
         for k in range(topk):
@@ -155,6 +158,8 @@ def baseline_moe_scatter(
             s = experts_smooth_scale[exp].float()
             
             smoothed = h * s * w
+            unquantized_math[target_idx] = smoothed  # Track pure unquantized math
+            
             max_val = smoothed.abs().max().item()
             scale = max_val / 127.0
             
@@ -165,7 +170,7 @@ def baseline_moe_scatter(
             per_token_scale[target_idx] = scale
             tokens_offset[target_idx] = t
 
-    return out_token_to_scatter_offset, out_tokens_count, out_tokens_start, scatter_tokens, per_token_scale, tokens_offset
+    return out_token_to_scatter_offset, out_tokens_count, out_tokens_start, scatter_tokens, per_token_scale, tokens_offset, unquantized_math
 
 @pytest.mark.parametrize("num_tokens", [16, 40, 80, 128, 256, 512, 1024, 2048, 4096])
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024, 2048, 4096, 7168])
@@ -206,7 +211,7 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
     try:
         # 1. Run Torch Accuracy Baseline
         (ref_t_offset, ref_t_count, ref_t_start, ref_scatter_tokens, 
-         ref_per_scale, ref_tokens_offset) = baseline_moe_scatter(
+         ref_per_scale, ref_tokens_offset, ref_unquantized_tokens) = baseline_moe_scatter(
              selected_experts, moe_weights, hidden_states, experts_smooth_scale, num_experts
         )
 
@@ -241,6 +246,25 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
             
             diff = (out_scatter_tokens[sort_idx_custom].int() - ref_scatter_tokens[sort_idx_ref].int()).abs()
             assert diff.max().item() <= 1, "Quantized values diverge completely!"
+
+        # Reconstruct pure floats back from the custom kernel's output
+        custom_dequantized = out_scatter_tokens.float() * out_per_scale.unsqueeze(1)
+
+        flat_experts = selected_experts.long()
+        ref_indices = ref_t_start[flat_experts] + ref_t_offset
+        custom_indices = out_t_start[flat_experts] + out_t_offset
+
+        # Check pure float differences
+        float_diff = (custom_dequantized[custom_indices] - ref_unquantized_tokens[ref_indices]).abs()
+        max_float_error = float_diff.max().item()
+        
+        if KERNEL_SOURCE != "IPEX":
+            # Max error should be extremely small (< 0.5) from simple INT8 rounding distance
+            assert max_float_error < 0.5, f"Dequantized mathematical outputs diverge! Max float error: {max_float_error}"
+        else:
+            # IPEX will likely print massive numbers here, proving uninitialized memory
+            if max_float_error > 1.0:
+                print(f"IPEX kernel produced garbage float equivalents! Max error: {max_float_error}")
 
         # 2. Benchmarks
         def bench_fn(is_custom, warmup=25, iters=1000):
