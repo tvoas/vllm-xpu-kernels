@@ -219,27 +219,27 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
         torch.testing.assert_close(out_t_count, ref_t_count)
         torch.testing.assert_close(out_t_start, ref_t_start)
 
-        # 2. Extract Valid Mappings Globally
-        # Sort values globally. Bypass layout race conditions by tracking only valid routed counts.
-        total_valid = ref_t_count.sum().item()
+        # 2. Direct 1:1 Mapping
+        # Extract the exact destination row for every (token, topk) combination using the kernel's own routing metadata
+        flat_experts = selected_experts.long()
         
-        custom_scales_sorted = out_per_scale.sort(descending=True)[0][:total_valid]
-        ref_scales_sorted = ref_per_scale.sort(descending=True)[0][:total_valid]
+        # Where Pytorch put them
+        ref_indices = ref_t_start[flat_experts] + ref_t_offset
+        # Where the Custom Kernel put them
+        custom_indices = out_t_start[flat_experts] + out_t_offset
 
+        # Validate Scales
         torch.testing.assert_close(
-            custom_scales_sorted, 
-            ref_scales_sorted, 
+            out_per_scale[custom_indices], 
+            ref_per_scale[ref_indices], 
             atol=5e-2, rtol=5e-2
         )
         
-        # Sort the row-wise sums of the int8 tokens to circumvent flat index-shifting issues
-        custom_row_sums = out_scatter_tokens.float().sum(dim=-1).sort(descending=True)[0][:total_valid]
-        ref_row_sums = ref_scatter_tokens.float().sum(dim=-1).sort(descending=True)[0][:total_valid]
-
-        diff = (custom_row_sums - ref_row_sums).abs()
-        # Allow an average deviation of <= 2.5 int8 units per element in a row due to transcendental/round varying
-        max_allowed_diff = hidden_size * 2.5
-        assert diff.max().item() <= max_allowed_diff, f"Quantized row sums diverge! Max diff: {diff.max().item()}"
+        # Validate INT8 Quantized Math
+        diff = (out_scatter_tokens[custom_indices].int() - ref_scatter_tokens[ref_indices].int()).abs()
+        
+        # Allow an absolute difference of <= 5 due to hardware transcendental/accumulation variances in the scale finding
+        assert diff.max().item() <= 5, f"Quantized mathematical outputs diverge! Max diff: {diff.max().item()}"
 
         # 3. Benchmarks
         def bench_fn(is_custom, warmup=25, iters=1000):
