@@ -173,7 +173,9 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts):
     shared_experts_num = 0
 
     if KERNEL_SOURCE == "IPEX":
-        if not hasattr(torch.ops, "torch_ipex") or not hasattr(torch.ops.torch_ipex, "moe_scatter_dynamic_quant"):
+        if not hasattr(torch.ops, "torch_ipex"):
+            pytest.skip("IPEX not found.")
+        if hasattr(torch.ops.torch_ipex, "moe_scatter_dynamic_quant"):
             pytest.skip("IPEX kernel not found.")
         custom_op = torch.ops.torch_ipex.moe_scatter_dynamic_quant
     else:
