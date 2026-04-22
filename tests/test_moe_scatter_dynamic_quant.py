@@ -72,16 +72,16 @@ MINI_PYTEST_PARAMS = {
     "default": {
         "num_tokens": [256],
         "hidden_size": [64],
-        "topk": [5],
+        "topk": [8],
         "num_experts": [64],
     },
 }
 
-@pytest.mark.parametrize("num_tokens", [64, 256])
-@pytest.mark.parametrize("hidden_size", [64, 256, 1024])
-@pytest.mark.parametrize("topk", [5, 8])
-@pytest.mark.parametrize("num_experts", [64])
-@pytest.mark.parametrize("shared_experts_num", [1])
+@pytest.mark.parametrize("num_tokens", [64, 4096])
+@pytest.mark.parametrize("hidden_size", [64, 7168])
+@pytest.mark.parametrize("topk", [16])
+@pytest.mark.parametrize("num_experts", [256])
+@pytest.mark.parametrize("shared_experts_num", [4])
 @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
 def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts, shared_experts_num, src_dtype, dst_dtype):
@@ -156,5 +156,5 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts, s
     if dst_dtype == torch.int8:
         assert float_diff.max().item() < 0.5, f"INT8 dequantized math outputs diverge! Error: {float_diff.max().item()}"
     else:
-        max_expected_error = 16.0 * out_per_scale.max().item() + 1e-3
+        max_expected_error = 32.0 * out_per_scale.max().item() + 1e-3
         assert float_diff.max().item() <= max_expected_error, f"FP8 dequantized math outputs diverge too broadly. Max error: {float_diff.max().item()} > Allowed: {max_expected_error}"

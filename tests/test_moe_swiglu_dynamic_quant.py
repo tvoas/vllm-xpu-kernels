@@ -46,8 +46,8 @@ MINI_PYTEST_PARAMS = {
     },
 }
 
-@pytest.mark.parametrize("num_scattered", [64, 256, 1024, 4096])
-@pytest.mark.parametrize("hidden_size", [64, 128, 256, 1024, 4096])
+@pytest.mark.parametrize("num_scattered", [64, 1024, 4096])
+@pytest.mark.parametrize("hidden_size", [64, 2048, 8192])
 @pytest.mark.parametrize("num_experts", [64, 256])
 @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
