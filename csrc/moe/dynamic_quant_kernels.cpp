@@ -222,11 +222,22 @@ void moe_scatter_dynamic_quant_impl(
         cgh.fill(ext_tokens_cnt_ptr, 0, n_expert_total);
     });
 
-    // Pass 1: Global memory atomic token counting
+    // Calculate a grouped layout for Pass 1 to enable Sub-Group vectorization 
+    int pass1_wg_size = 256;
+    int pass1_global_range = ((n_tokens + pass1_wg_size - 1) / pass1_wg_size) * pass1_wg_size;
+
+    // Pass 1: Global memory atomic token counting (Optimized with nd_range)
     auto e1 = queue.submit([&](sycl::handler& cgh) {
         cgh.depends_on(e0);
-        cgh.parallel_for(sycl::range<1>(n_tokens), [=](sycl::item<1> item) {
-            int token_idx = item.get_id(0);
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(pass1_global_range), sycl::range<1>(pass1_wg_size)), 
+        [=](sycl::nd_item<1> item) {
+            int token_idx = item.get_global_id(0);
+            
+            // Boundary check since global_range is rounded up to the nearest wg_size multiple
+            if (token_idx >= n_tokens) {
+                return;
+            }
+
             for (int k = 0; k < topk; ++k) {
                 int expert_id = selected_experts_ptr[token_idx * topk + k];
                 sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>
