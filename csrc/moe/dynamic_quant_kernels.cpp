@@ -99,7 +99,7 @@ void moe_swiglu_dynamic_quant_impl(
                 T_in* scatter_token_base = scatter_tokens_ptr + (token_start + token_idx) * 2 * hidden_size;
                 T_out* output_base = quant_tokens_ptr + (token_start + token_idx) * hidden_size;
 
-                float thread_max = 0.0f;
+                simd<float, CHUNK> thread_max_vec = 0.0f;
 
                 // Pass 1: Extrema tracking
                 for (int bid = loc_id; bid < num_blocks; bid += wg_size) {
@@ -121,10 +121,11 @@ void moe_swiglu_dynamic_quant_impl(
                         simd<float, CHUNK> scaled_swiglu_tokens = swiglu_tokens * scale;
                         simd<float, CHUNK> scaled_swiglu_tokens_abs = sycl::ext::intel::esimd::abs(scaled_swiglu_tokens);
 
-                        float max_value = hmax<float, float, CHUNK>(scaled_swiglu_tokens_abs);
-                        thread_max = std::max(thread_max, max_value);
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, scaled_swiglu_tokens_abs);
                     }
                 }
+
+                float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
 
                 slm_block_store<float, 1>(loc_id * sizeof(float), thread_max);
                 barrier();
@@ -299,7 +300,7 @@ void moe_scatter_dynamic_quant_impl(
                 const int target_idx = expert_start + offset;
                 const float weight = moe_weights_ptr[token_k_idx];
 
-                float thread_max = 0.0f;
+                simd<float, CHUNK> thread_max_vec = 0.0f;
 
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
@@ -312,10 +313,11 @@ void moe_scatter_dynamic_quant_impl(
                         simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
                         simd<float, CHUNK> smoothed_abs = sycl::ext::intel::esimd::abs(smoothed);
 
-                        float max_val = hmax<float, float, CHUNK>(smoothed_abs);
-                        thread_max = std::max(thread_max, max_val);
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, smoothed_abs);
                     }
                 }
+
+                float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
 
                 slm_block_store<float, 1>(loc_id * sizeof(float), thread_max);
                 barrier();
