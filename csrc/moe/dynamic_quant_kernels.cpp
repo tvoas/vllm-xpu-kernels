@@ -222,7 +222,7 @@ void moe_swiglu_dynamic_quant_impl(
     //if (hidden_size % 1024 == 0) return dispatch_slm(std::integral_constant<int, 16>{});
     //if (hidden_size %  512 == 0) return dispatch_slm(std::integral_constant<int, 8>{});
     //if (hidden_size %  256 == 0) return dispatch_slm(std::integral_constant<int, 4>{});
-    //if (hidden_size %  128 == 0) return dispatch_slm(std::integral_constant<int, 2>{});
+    if (hidden_size %  128 == 0) return dispatch_slm(std::integral_constant<int, 2>{});
                                  return dispatch_slm(std::integral_constant<int, 1>{});
 }
 
@@ -449,7 +449,7 @@ void moe_scatter_dynamic_quant_impl(
     //if (hd_size % 1024 == 0) return dispatch_slm(std::integral_constant<int, 16>{});
     //if (hd_size %  512 == 0) return dispatch_slm(std::integral_constant<int, 8>{});
     //if (hd_size %  256 == 0) return dispatch_slm(std::integral_constant<int, 4>{});
-    //if (hd_size %  128 == 0) return dispatch_slm(std::integral_constant<int, 2>{});
+    if (hd_size %  128 == 0) return dispatch_slm(std::integral_constant<int, 2>{});
                              return dispatch_slm(std::integral_constant<int, 1>{});
 }
 
