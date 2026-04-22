@@ -198,6 +198,10 @@ void moe_scatter_dynamic_quant_impl(
     torch::Tensor& scatter_tokens_offset,
     int64_t shared_experts_num) {
 
+    // Python frontend concatenates shared experts into selected_experts, 
+    // meaning the XPU kernel processes them uniformly via the topk dimension.
+    (void)shared_experts_num;
+
     auto& queue = vllm::xpu::vllmGetQueue();
 
     int topk = selected_experts.size(1);
@@ -213,8 +217,14 @@ void moe_scatter_dynamic_quant_impl(
     auto ext_tokens_start_ptr = experts_token_start.data_ptr<int32_t>();
     auto token_to_scatter_offset_ptr = token_to_scatter_offset.data_ptr<int32_t>();
 
+    // Pass 0: Zero out the experts_token_count array (Required since Pass 1 increments it atomically)
+    auto e0 = queue.submit([&](sycl::handler& cgh) {
+        cgh.fill(ext_tokens_cnt_ptr, 0, n_expert_total);
+    });
+
     // Pass 1: Global memory atomic token counting
     auto e1 = queue.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(e0);
         cgh.parallel_for(sycl::range<1>(n_tokens), [=](sycl::item<1> item) {
             int token_idx = item.get_id(0);
             for (int k = 0; k < topk; ++k) {
@@ -370,11 +380,37 @@ void moe_swiglu_dynamic_quant(
 
     at::DeviceGuard guard(scatter_tokens.device());
 
+    // Contiguity checks
     TORCH_CHECK(scatter_tokens.is_contiguous(), "scatter_tokens must be contiguous");
     TORCH_CHECK(smooth_scale.is_contiguous(), "smooth_scale must be contiguous");
+    TORCH_CHECK(experts_token_count.is_contiguous(), "experts_token_count must be contiguous");
+    TORCH_CHECK(experts_token_start.is_contiguous(), "experts_token_start must be contiguous");
     TORCH_CHECK(quant_tokens.is_contiguous(), "quant_tokens must be contiguous");
+    TORCH_CHECK(per_token_scale.is_contiguous(), "per_token_scale must be contiguous");
 
+    // Dtype checks
     TORCH_CHECK(smooth_scale.scalar_type() == at::ScalarType::Float, "smooth_scale must be Float32");
+    TORCH_CHECK(per_token_scale.scalar_type() == at::ScalarType::Float, "per_token_scale must be Float32");
+    TORCH_CHECK(experts_token_count.scalar_type() == at::ScalarType::Int, "experts_token_count must be Int32");
+    TORCH_CHECK(experts_token_start.scalar_type() == at::ScalarType::Int, "experts_token_start must be Int32");
+
+    // Shape checks
+    int64_t num_scattered = scatter_tokens.size(0);
+    int64_t hidden_size2 = scatter_tokens.size(1);
+    TORCH_CHECK(hidden_size2 % 2 == 0, "scatter_tokens hidden dimension must be divisible by 2");
+    int64_t hidden_size = hidden_size2 / 2;
+
+    // Block size alignment check for ESIMD vectorized loads
+    TORCH_CHECK(hidden_size >= 64 && hidden_size % 64 == 0, 
+                "hidden_size must be a positive multiple of 64 for vectorized XPU block loads, got ", hidden_size);
+
+    TORCH_CHECK(quant_tokens.size(0) == num_scattered && quant_tokens.size(1) == hidden_size, 
+                "quant_tokens shape mismatch");
+    TORCH_CHECK(smooth_scale.size(0) == total_experts_num && smooth_scale.size(1) == hidden_size, 
+                "smooth_scale shape mismatch");
+    TORCH_CHECK(experts_token_count.size(0) == total_experts_num, "experts_token_count size mismatch");
+    TORCH_CHECK(experts_token_start.size(0) == total_experts_num, "experts_token_start size mismatch");
+    TORCH_CHECK(per_token_scale.size(0) == num_scattered, "per_token_scale size mismatch");
 
     auto in_dtype = scatter_tokens.scalar_type();
     auto out_dtype = quant_tokens.scalar_type();
@@ -400,9 +436,37 @@ void moe_scatter_dynamic_quant(
 
     at::DeviceGuard guard(hidden_states.device());
 
-    TORCH_CHECK(hidden_states.is_contiguous() && scatter_tokens.is_contiguous(), "Tensors must be contiguous");
+    // Contiguity checks
+    TORCH_CHECK(selected_experts.is_contiguous(), "selected_experts must be contiguous");
+    TORCH_CHECK(moe_weights.is_contiguous(), "moe_weights must be contiguous");
+    TORCH_CHECK(token_to_scatter_offset.is_contiguous(), "token_to_scatter_offset must be contiguous");
+    TORCH_CHECK(experts_token_count.is_contiguous(), "experts_token_count must be contiguous");
+    TORCH_CHECK(experts_token_start.is_contiguous(), "experts_token_start must be contiguous");
+    TORCH_CHECK(hidden_states.is_contiguous(), "hidden_states must be contiguous");
+    TORCH_CHECK(experts_smooth_scale.is_contiguous(), "experts_smooth_scale must be contiguous");
+    TORCH_CHECK(scatter_tokens.is_contiguous(), "scatter_tokens must be contiguous");
+    TORCH_CHECK(scatter_per_token_scale.is_contiguous(), "scatter_per_token_scale must be contiguous");
+    TORCH_CHECK(scatter_tokens_offset.is_contiguous(), "scatter_tokens_offset must be contiguous");
+
+    // Dtype checks (Int32)
+    TORCH_CHECK(selected_experts.scalar_type() == at::ScalarType::Int, "selected_experts must be Int32");
+    TORCH_CHECK(token_to_scatter_offset.scalar_type() == at::ScalarType::Int, "token_to_scatter_offset must be Int32");
+    TORCH_CHECK(experts_token_count.scalar_type() == at::ScalarType::Int, "experts_token_count must be Int32");
+    TORCH_CHECK(experts_token_start.scalar_type() == at::ScalarType::Int, "experts_token_start must be Int32");
+    TORCH_CHECK(scatter_tokens_offset.scalar_type() == at::ScalarType::Int, "scatter_tokens_offset must be Int32");
+
+    // Dtype checks (Float32)
+    TORCH_CHECK(moe_weights.scalar_type() == at::ScalarType::Float, "moe_weights must be Float32");
     TORCH_CHECK(experts_smooth_scale.scalar_type() == at::ScalarType::Float, "experts_smooth_scale must be Float32");
+    TORCH_CHECK(scatter_per_token_scale.scalar_type() == at::ScalarType::Float, "scatter_per_token_scale must be Float32");
+
+    // Logical shape checks
     TORCH_CHECK(experts_token_count.size(0) == experts_token_start.size(0), "Token count and start tensors must match in size");
+
+    // Block size alignment check for ESIMD vectorized loads
+    int64_t hd_size = hidden_states.size(1);
+    TORCH_CHECK(hd_size >= 64 && hd_size % 64 == 0, 
+                "hidden_states inner dimension must be a positive multiple of 64 for XPU block loads, got ", hd_size);
 
     auto in_dtype = hidden_states.scalar_type();
     auto out_dtype = scatter_tokens.scalar_type();

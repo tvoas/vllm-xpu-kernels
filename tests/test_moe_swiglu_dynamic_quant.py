@@ -61,13 +61,9 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts, src_d
     experts_token_count[:] = tokens_per_expert
     experts_token_count[-1] = num_scattered - (tokens_per_expert * (num_experts - 1))
 
-    start = 0
-    max_token_num = 0
-    for i in range(num_experts):
-        experts_token_start[i] = start
-        start += experts_token_count[i].item()
-        if experts_token_count[i].item() > max_token_num:
-            max_token_num = experts_token_count[i].item()
+    if num_experts > 1:
+        experts_token_start[1:] = torch.cumsum(experts_token_count[:-1], dim=0)
+    max_token_num = int(experts_token_count.max().item())
 
     scatter_tokens = torch.randn((num_scattered, hidden_size * 2), dtype=src_dtype, device=device)
     smooth_scale = torch.rand((num_experts, hidden_size), dtype=torch.float32, device=device)
