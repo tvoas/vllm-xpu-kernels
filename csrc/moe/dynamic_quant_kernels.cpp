@@ -79,7 +79,7 @@ void moe_swiglu_dynamic_quant_impl(
         sycl::range<3> LocalRange(1, 1, wg_size);
 
         queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::nd_range<3>(GlobalRange, LocalRange), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+            cgh.parallel_for(sycl::nd_range<3>(GlobalRange, LocalRange), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
                 slm_init(64 * sizeof(float));
 
                 const int loc_id = item.get_local_id(2);
@@ -236,7 +236,7 @@ void moe_scatter_dynamic_quant_impl(
         sycl::local_accessor<int32_t, 1> local_expert_bases(n_expert_total, cgh);
         
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(pass1_global_range), sycl::range<1>(pass1_wg_size)), 
-        [=](sycl::nd_item<1> item) {
+        [=](sycl::nd_item<1> item) [[intel::kernel_args_restrict]] {
             int token_idx = item.get_global_id(0);
             int local_id = item.get_local_id(0);
             
@@ -327,7 +327,7 @@ void moe_scatter_dynamic_quant_impl(
         queue.submit([&](sycl::handler& cgh) {
             cgh.depends_on(e2);
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens * topk, wg_size), sycl::range<2>(1, wg_size)),
-            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
                 slm_init(64 * sizeof(float));
 
                 const int loc_id = item.get_local_id(1);
