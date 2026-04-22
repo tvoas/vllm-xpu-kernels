@@ -134,15 +134,13 @@ void moe_swiglu_dynamic_quant(
         });
     };
 
-    if (hidden_size % 512 == 0) {
-        launch_swiglu(std::integral_constant<int, 8>{});
-    } else if (hidden_size % 256 == 0) {
-        launch_swiglu(std::integral_constant<int, 4>{});
-    } else if (hidden_size % 128 == 0) {
-        launch_swiglu(std::integral_constant<int, 2>{});
-    } else {
-        launch_swiglu(std::integral_constant<int, 1>{});
-    }
+    //if (hidden_size % 4096 == 0) return launch_swiglu(std::integral_constant<int, 64>{});
+    //if (hidden_size % 2048 == 0) return launch_swiglu(std::integral_constant<int, 32>{});
+    //if (hidden_size % 1024 == 0) return launch_swiglu(std::integral_constant<int, 16>{});
+    //if (hidden_size %  512 == 0) return launch_swiglu(std::integral_constant<int, 8>{});
+    //if (hidden_size %  256 == 0) return launch_swiglu(std::integral_constant<int, 4>{});
+    //if (hidden_size %  128 == 0) return launch_swiglu(std::integral_constant<int, 2>{});
+                                 return launch_swiglu(std::integral_constant<int, 1>{});
 }
 
 void moe_scatter_dynamic_quant(
@@ -204,7 +202,7 @@ void moe_scatter_dynamic_quant(
     auto scatter_tokens_offset_ptr = scatter_tokens_offset.data_ptr<int32_t>();
 
     // Pass 3: Gather, quantize, and scatter
-    auto launch_step3 = [&](auto unroll_tag) {
+    auto launch_scatter = [&](auto unroll_tag) {
         constexpr int UNROLL = decltype(unroll_tag)::value;
         constexpr int CHUNK = 64;
         constexpr int BS = CHUNK * UNROLL;
@@ -286,14 +284,11 @@ void moe_scatter_dynamic_quant(
         });
     };
 
-    // Dispatch based on hidden size divisibility mapping to max stable unroll bounds
-    if (hd_size % 512 == 0) {
-        launch_step3(std::integral_constant<int, 8>{});
-    } else if (hd_size % 256 == 0) {
-        launch_step3(std::integral_constant<int, 4>{});
-    } else if (hd_size % 128 == 0) {
-        launch_step3(std::integral_constant<int, 2>{});
-    } else {
-        launch_step3(std::integral_constant<int, 1>{});
-    }
+    //if (hd_size % 4096 == 0) return launch_scatter(std::integral_constant<int, 64>{});
+    //if (hd_size % 2048 == 0) return launch_scatter(std::integral_constant<int, 32>{});
+    //if (hd_size % 1024 == 0) return launch_scatter(std::integral_constant<int, 16>{});
+    //if (hd_size %  512 == 0) return launch_scatter(std::integral_constant<int, 8>{});
+    //if (hd_size %  256 == 0) return launch_scatter(std::integral_constant<int, 4>{});
+    //if (hd_size %  128 == 0) return launch_scatter(std::integral_constant<int, 2>{});
+                             return launch_scatter(std::integral_constant<int, 1>{});
 }
