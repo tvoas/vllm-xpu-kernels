@@ -227,23 +227,71 @@ void moe_scatter_dynamic_quant_impl(
     int pass1_wg_size = 256;
     int pass1_global_range = ((n_tokens + pass1_wg_size - 1) / pass1_wg_size) * pass1_wg_size;
 
-    // Pass 1: Global memory atomic token counting (Optimized with nd_range)
+    // Pass 1: Global memory atomic token counting (Optimized with nd_range and SLM)
     auto e1 = queue.submit([&](sycl::handler& cgh) {
         cgh.depends_on(e0);
+        
+        // SLM allocation for histogram bins and local bases
+        sycl::local_accessor<int32_t, 1> local_expert_counts(n_expert_total, cgh);
+        sycl::local_accessor<int32_t, 1> local_expert_bases(n_expert_total, cgh);
+        
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(pass1_global_range), sycl::range<1>(pass1_wg_size)), 
         [=](sycl::nd_item<1> item) {
             int token_idx = item.get_global_id(0);
+            int local_id = item.get_local_id(0);
             
-            // Boundary check since global_range is rounded up to the nearest wg_size multiple
-            if (token_idx >= n_tokens) {
-                return;
+            // 1. Initialize SLM histogram bins distributed across the work-group
+            for (int i = local_id; i < n_expert_total; i += pass1_wg_size) {
+                local_expert_counts[i] = 0;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            // Cache up to 8 topk experts privately to avoid intermediate GMEM writes
+            int my_experts[8]; 
+            int my_offsets[8];
+
+            // 2. Local token counting using SLM atomics
+            if (token_idx < n_tokens) {
+                for (int k = 0; k < topk; ++k) {
+                    int expert_id = selected_experts_ptr[token_idx * topk + k];
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>
+                        atomic_cnt(local_expert_counts[expert_id]);
+                    int local_offset = atomic_cnt.fetch_add(1);
+                    
+                    if (k < 8) {
+                        my_experts[k] = expert_id;
+                        my_offsets[k] = local_offset;
+                    } else {
+                        // Fallback to storing in global memory early if topk somehow exceeds 8
+                        token_to_scatter_offset_ptr[token_idx * topk + k] = local_offset;
+                    }
+                }
             }
 
-            for (int k = 0; k < topk; ++k) {
-                int expert_id = selected_experts_ptr[token_idx * topk + k];
-                sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>
-                    atomic_cnt(ext_tokens_cnt_ptr[expert_id]);
-                token_to_scatter_offset_ptr[token_idx * topk + k] = atomic_cnt.fetch_add(1);
+            item.barrier(sycl::access::fence_space::local_space);
+
+            // 3. One global atomic per active expert per work-group
+            for (int i = local_id; i < n_expert_total; i += pass1_wg_size) {
+                int count = local_expert_counts[i];
+                if (count > 0) {
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>
+                        global_cnt(ext_tokens_cnt_ptr[i]);
+                    local_expert_bases[i] = global_cnt.fetch_add(count);
+                }
+            }
+
+            item.barrier(sycl::access::fence_space::local_space);
+
+            // 4. Resolve final global offsets
+            if (token_idx < n_tokens) {
+                for (int k = 0; k < topk; ++k) {
+                    if (k < 8) {
+                        token_to_scatter_offset_ptr[token_idx * topk + k] = my_offsets[k] + local_expert_bases[my_experts[k]];
+                    } else {
+                        int expert_id = selected_experts_ptr[token_idx * topk + k];
+                        token_to_scatter_offset_ptr[token_idx * topk + k] += local_expert_bases[expert_id];
+                    }
+                }
             }
         });
     });
