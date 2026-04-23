@@ -85,24 +85,29 @@ void moe_swiglu_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                slm_init(64 * sizeof(float));
+                // Initialize SLM to hold 64 floats for extrema tracking + 1 int for expert_idx
+                slm_init(64 * sizeof(float) + sizeof(int));
 
                 const int loc_id = item.get_local_id(1);
+                const int flat_idx = item.get_group(0);
+
                 if (loc_id == 0) {
                     slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
+
+                    // Only thread 0 scans global memory to resolve the expert owner
+                    int found_expert_idx = 0;
+                    for (int e = total_experts_num - 1; e >= 0; --e) {
+                        if (flat_idx >= experts_token_start_ptr[e] && flat_idx < (experts_token_start_ptr[e] + experts_token_count_ptr[e])) {
+                            found_expert_idx = e;
+                            break;
+                        }
+                    }
+                    slm_block_store<int, 1>(64 * sizeof(float), simd<int, 1>(found_expert_idx));
                 }
                 barrier();
 
-                const int flat_idx = item.get_group(0);
-
-                // Linearly scan backwards to resolve which expert owns this token
-                int expert_idx = 0;
-                for (int e = total_experts_num - 1; e >= 0; --e) {
-                    if (flat_idx >= experts_token_start_ptr[e] && flat_idx < (experts_token_start_ptr[e] + experts_token_count_ptr[e])) {
-                        expert_idx = e;
-                        break;
-                    }
-                }
+                // Broadcast resolved expert index to all threads in the work group
+                int expert_idx = slm_block_load<int, 1>(64 * sizeof(float))[0];
 
                 T_in* scatter_token_base = scatter_tokens_ptr + flat_idx * 2 * hidden_size;
                 T_out* output_base = quant_tokens_ptr + flat_idx * hidden_size;
