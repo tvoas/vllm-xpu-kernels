@@ -69,6 +69,7 @@ void moe_swiglu_dynamic_quant_impl(
     auto per_token_scale_ptr = per_token_scale.data_ptr<float>();
 
     int hidden_size = scatter_tokens.size(1) / 2;
+    int num_scattered = scatter_tokens.size(0);
     constexpr float quant_max = QuantMax<T_out>::value;
 
     auto launch_swiglu = [&](auto unroll_tag) {
@@ -79,29 +80,32 @@ void moe_swiglu_dynamic_quant_impl(
         int num_blocks = hidden_size / BS;
         int wg_size = std::min(num_blocks, 64);
 
-        sycl::range<3> GlobalRange(total_experts_num, max_token_num, wg_size);
-        sycl::range<3> LocalRange(1, 1, wg_size);
+        sycl::range<2> GlobalRange(num_scattered, wg_size);
+        sycl::range<2> LocalRange(1, wg_size);
 
         queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::nd_range<3>(GlobalRange, LocalRange), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
+            cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
                 slm_init(64 * sizeof(float));
 
-                const int loc_id = item.get_local_id(2);
+                const int loc_id = item.get_local_id(1);
                 if (loc_id == 0) {
                     slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
                 }
                 barrier();
 
-                const int expert_idx = item.get_global_id(0);
-                const int token_idx = item.get_global_id(1);
+                const int flat_idx = item.get_group(0);
 
-                if (token_idx >= experts_token_count_ptr[expert_idx]) {
-                    return;
+                // Linearly scan backwards to resolve which expert owns this token
+                int expert_idx = 0;
+                for (int e = total_experts_num - 1; e >= 0; --e) {
+                    if (flat_idx >= experts_token_start_ptr[e] && flat_idx < (experts_token_start_ptr[e] + experts_token_count_ptr[e])) {
+                        expert_idx = e;
+                        break;
+                    }
                 }
 
-                const int token_start = experts_token_start_ptr[expert_idx];
-                T_in* scatter_token_base = scatter_tokens_ptr + (token_start + token_idx) * 2 * hidden_size;
-                T_out* output_base = quant_tokens_ptr + (token_start + token_idx) * hidden_size;
+                T_in* scatter_token_base = scatter_tokens_ptr + flat_idx * 2 * hidden_size;
+                T_out* output_base = quant_tokens_ptr + flat_idx * hidden_size;
 
                 simd<float, CHUNK> thread_max_vec = 0.0f;
 
@@ -174,7 +178,7 @@ void moe_swiglu_dynamic_quant_impl(
 
                 if (loc_id == 0) {
                     block_store<float, 1>(
-                        per_token_scale_ptr + token_start + token_idx, simd<float, 1>(this_token_scale), properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
+                        per_token_scale_ptr + flat_idx, simd<float, 1>(this_token_scale), properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
                 }
             });
         });
