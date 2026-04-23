@@ -55,6 +55,10 @@ void moe_swiglu_dynamic_quant_impl(
     int64_t total_experts_num,
     int64_t max_token_num) {
 
+    if (max_token_num <= 0 || total_experts_num <= 0) {
+        return;
+    }
+
     auto& queue = vllm::xpu::vllmGetQueue();
 
     auto scatter_tokens_ptr = reinterpret_cast<T_in*>(scatter_tokens.data_ptr());
@@ -199,6 +203,11 @@ void moe_scatter_dynamic_quant_impl(
     torch::Tensor& scatter_tokens_offset,
     int64_t shared_experts_num) {
 
+    int n_tokens = selected_experts.size(0);
+    if (n_tokens <= 0) {
+        return;
+    }
+
     // Python frontend concatenates shared experts into selected_experts, 
     // meaning the XPU kernel processes them uniformly via the topk dimension.
     (void)shared_experts_num;
@@ -206,7 +215,6 @@ void moe_scatter_dynamic_quant_impl(
     auto& queue = vllm::xpu::vllmGetQueue();
 
     int topk = selected_experts.size(1);
-    int n_tokens = selected_experts.size(0);
     int n_expert = experts_token_count.size(0);
     int hd_size = hidden_states.size(1);
     int n_expert_total = n_expert;
@@ -254,6 +262,12 @@ void moe_scatter_dynamic_quant_impl(
             if (token_idx < n_tokens) {
                 for (int k = 0; k < topk; ++k) {
                     int expert_id = selected_experts_ptr[token_idx * topk + k];
+                    
+                    // Out-of-bounds SLM safeguard to prevent complete hardware lockup on invalid tokens
+                    if (expert_id < 0 || expert_id >= n_expert_total) {
+                        continue;
+                    }
+
                     sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>
                         atomic_cnt(local_expert_counts[expert_id]);
                     int local_offset = atomic_cnt.fetch_add(1);
@@ -285,10 +299,16 @@ void moe_scatter_dynamic_quant_impl(
             // 4. Resolve final global offsets
             if (token_idx < n_tokens) {
                 for (int k = 0; k < topk; ++k) {
+                    int expert_id = selected_experts_ptr[token_idx * topk + k];
+                    
+                    // Skip padded tokens to prevent OOB SLM access on `my_experts[k]` or `expert_id`
+                    if (expert_id < 0 || expert_id >= n_expert_total) {
+                        continue;
+                    }
+
                     if (k < 8) {
                         token_to_scatter_offset_ptr[token_idx * topk + k] = my_offsets[k] + local_expert_bases[my_experts[k]];
                     } else {
-                        int expert_id = selected_experts_ptr[token_idx * topk + k];
                         token_to_scatter_offset_ptr[token_idx * topk + k] += local_expert_bases[expert_id];
                     }
                 }
@@ -328,6 +348,15 @@ void moe_scatter_dynamic_quant_impl(
             cgh.depends_on(e2);
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens * topk, wg_size), sycl::range<2>(1, wg_size)),
             [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
+                
+                const int token_k_idx = item.get_group(0);
+                const int expert_id = selected_experts_ptr[token_k_idx];
+                
+                // Prevents OOB array access on `ext_tokens_start_ptr` and block_load memory violations.
+                if (expert_id < 0 || expert_id >= n_expert_total) {
+                    return;
+                }
+
                 slm_init(64 * sizeof(float));
 
                 const int loc_id = item.get_local_id(1);
@@ -338,10 +367,8 @@ void moe_scatter_dynamic_quant_impl(
                 }
                 barrier();
 
-                const int token_k_idx = item.get_group(0);
                 const int token_idx = token_k_idx / topk;
 
-                const int expert_id = selected_experts_ptr[token_k_idx];
                 const int offset = token_to_scatter_offset_ptr[token_k_idx];
                 const int expert_start = ext_tokens_start_ptr[expert_id];
 
