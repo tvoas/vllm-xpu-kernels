@@ -94,14 +94,25 @@ void moe_swiglu_dynamic_quant_impl(
                 if (loc_id == 0) {
                     slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
 
-                    // Only thread 0 scans global memory to resolve the expert owner
+                    int left = 0;
+                    int right = total_experts_num - 1;
                     int found_expert_idx = 0;
-                    for (int e = total_experts_num - 1; e >= 0; --e) {
-                        if (flat_idx >= experts_token_start_ptr[e] && flat_idx < (experts_token_start_ptr[e] + experts_token_count_ptr[e])) {
-                            found_expert_idx = e;
+                    
+                    while (left <= right) {
+                        int mid = left + (right - left) / 2;
+                        int start = experts_token_start_ptr[mid];
+                        int count = experts_token_count_ptr[mid];
+                        
+                        if (flat_idx >= start && flat_idx < start + count) {
+                            found_expert_idx = mid;
                             break;
+                        } else if (flat_idx < start) {
+                            right = mid - 1;
+                        } else {
+                            left = mid + 1;
                         }
                     }
+
                     slm_block_store<int, 1>(64 * sizeof(float), simd<int, 1>(found_expert_idx));
                 }
                 barrier();
