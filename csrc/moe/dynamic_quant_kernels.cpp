@@ -85,15 +85,13 @@ void moe_swiglu_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                // Initialize SLM to hold 64 floats for extrema tracking + 1 int for expert_idx
-                slm_init(64 * sizeof(float) + sizeof(int));
+                // Initialize SLM: 64 threads * 16B (padded maxes) + 16B (scale) + 16B (expert_idx) = 1056 bytes
+                slm_init(1056);
 
                 const int loc_id = item.get_local_id(1);
                 const int flat_idx = item.get_group(0);
 
                 if (loc_id == 0) {
-                    slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
-
                     int left = 0;
                     int right = total_experts_num - 1;
                     int found_expert_idx = 0;
@@ -113,12 +111,13 @@ void moe_swiglu_dynamic_quant_impl(
                         }
                     }
 
-                    slm_block_store<int, 1>(64 * sizeof(float), simd<int, 1>(found_expert_idx));
+                    // Broadcast found_expert_idx to all 4 lanes for 16-byte block requirement
+                    slm_block_store<int, 4>(1040, simd<int, 4>(found_expert_idx));
                 }
                 barrier();
 
                 // Broadcast resolved expert index to all threads in the work group
-                int expert_idx = slm_block_load<int, 1>(64 * sizeof(float))[0];
+                int expert_idx = slm_block_load<int, 4>(1040)[0];
 
                 T_in* scatter_token_base = scatter_tokens_ptr + flat_idx * 2 * hidden_size;
                 T_out* output_base = quant_tokens_ptr + flat_idx * hidden_size;
@@ -151,14 +150,29 @@ void moe_swiglu_dynamic_quant_impl(
 
                 float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
 
-                slm_block_store<float, 1>(loc_id * sizeof(float), thread_max);
+                // Offset by 16 bytes per thread (loc_id * 16 guarantees OWORD alignment!)
+                slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max));
                 barrier();
 
-                simd<float, 64> max_value_full = slm_block_load<float, 64>(0);
-                float max_value_final = hmax<float, float, 64>(max_value_full);
+                float this_token_scale = 1.0f;
 
-                float raw_token_scale = max_value_final / quant_max;
-                float this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
+                if (loc_id == 0) {
+                    float max_value_final = 0.0f;
+                    // Sequentially load the aligned maxes safely
+                    for (int i = 0; i < wg_size; i++) {
+                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                        if (val[0] > max_value_final) max_value_final = val[0];
+                    }
+
+                    float raw_token_scale = max_value_final / quant_max;
+                    this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
+                    
+                    // Store scale at offset 1024 (1024 % 16 == 0)
+                    slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
+                }
+                barrier();
+
+                this_token_scale = slm_block_load<float, 4>(1024)[0];
                 float recip_scale = 1.0f / this_token_scale;
 
                 // Pass 2: Recompute, quantize, and store
@@ -193,8 +207,7 @@ void moe_swiglu_dynamic_quant_impl(
                 }
 
                 if (loc_id == 0) {
-                    block_store<float, 1>(
-                        per_token_scale_ptr + flat_idx, simd<float, 1>(this_token_scale), properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
+                    per_token_scale_ptr[flat_idx] = this_token_scale;
                 }
             });
         });
@@ -377,15 +390,10 @@ void moe_scatter_dynamic_quant_impl(
                     return;
                 }
 
-                slm_init(64 * sizeof(float));
+                // Initialize 1040 bytes: 1024 bytes (64 max threads * 16B padded maxes) + 16B (scale)
+                slm_init(1040);
 
                 const int loc_id = item.get_local_id(1);
-
-                if (loc_id == 0) {
-                    simd<float, 64> zeros = 0.0f;
-                    slm_block_store<float, 64>(0, zeros);
-                }
-                barrier();
 
                 const int token_idx = token_k_idx / topk;
 
@@ -414,14 +422,28 @@ void moe_scatter_dynamic_quant_impl(
 
                 float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
 
-                slm_block_store<float, 1>(loc_id * sizeof(float), thread_max);
+                // Use strictly 16-byte OWORD aligned block stores!
+                slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max));
                 barrier();
 
-                simd<float, 64> max_value_full = slm_block_load<float, 64>(0);
-                float max_value_final = hmax<float, float, 64>(max_value_full);
+                float max_value_final = 0.0f;
+                // All threads sequentially fetch the aligned maxes safely
+                for (int i = 0; i < wg_size; i++) {
+                    simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                    if (val[0] > max_value_final) max_value_final = val[0];
+                }
+
                 float raw_token_scale = max_value_final / quant_max;
                 float this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
                 float recip_scale = 1.0f / this_token_scale;
+                
+                if (loc_id == 0) {
+                    slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
+                }
+                barrier();
+
+                this_token_scale = slm_block_load<float, 4>(1024)[0];
+                recip_scale = 1.0f / this_token_scale;
 
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
@@ -446,8 +468,8 @@ void moe_scatter_dynamic_quant_impl(
                 }
 
                 if (loc_id == 0) {
-                    block_store<float, 1>(scatter_per_token_scale_ptr + target_idx, simd<float, 1>(this_token_scale), properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
-                    block_store<int32_t, 1>(scatter_tokens_offset_ptr + target_idx, simd<int32_t, 1>(token_idx), properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
+                    scatter_per_token_scale_ptr[target_idx] = this_token_scale;
+                    scatter_tokens_offset_ptr[target_idx] = token_idx;
                 }
             });
         });
