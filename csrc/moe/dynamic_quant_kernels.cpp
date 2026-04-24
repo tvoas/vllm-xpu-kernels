@@ -158,10 +158,13 @@ void moe_swiglu_dynamic_quant_impl(
 
                 if (loc_id == 0) {
                     float max_value_final = 0.0f;
-                    // Sequentially load the aligned maxes safely
-                    for (int i = 0; i < wg_size; i++) {
-                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
-                        if (val[0] > max_value_final) max_value_final = val[0];
+                    // Fully unroll the loop up to max possible size (64) to eliminate dynamic branch latency
+#pragma unroll
+                    for (int i = 0; i < 64; i++) {
+                        if (i < wg_size) {
+                            simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                            if (val[0] > max_value_final) max_value_final = val[0];
+                        }
                     }
 
                     float raw_token_scale = max_value_final / quant_max;
@@ -207,7 +210,7 @@ void moe_swiglu_dynamic_quant_impl(
                 }
 
                 if (loc_id == 0) {
-                    per_token_scale_ptr[flat_idx] = this_token_scale;
+                    block_store<float, 1>(per_token_scale_ptr + flat_idx, this_token_scale);
                 }
             });
         });
@@ -427,10 +430,13 @@ void moe_scatter_dynamic_quant_impl(
                 barrier();
 
                 float max_value_final = 0.0f;
-                // All threads sequentially fetch the aligned maxes safely
-                for (int i = 0; i < wg_size; i++) {
-                    simd<float, 4> val = slm_block_load<float, 4>(i * 16);
-                    if (val[0] > max_value_final) max_value_final = val[0];
+                // Fully unroll the loop up to max possible size (64) to eliminate dynamic branch latency
+#pragma unroll
+                for (int i = 0; i < 64; i++) {
+                    if (i < wg_size) {
+                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                        if (val[0] > max_value_final) max_value_final = val[0];
+                    }
                 }
 
                 float raw_token_scale = max_value_final / quant_max;
@@ -468,8 +474,9 @@ void moe_scatter_dynamic_quant_impl(
                 }
 
                 if (loc_id == 0) {
-                    scatter_per_token_scale_ptr[target_idx] = this_token_scale;
-                    scatter_tokens_offset_ptr[target_idx] = token_idx;
+                    // Restore high-bandwidth native block messaging
+                    block_store<float, 1>(scatter_per_token_scale_ptr + target_idx, this_token_scale);
+                    block_store<int32_t, 1>(scatter_tokens_offset_ptr + target_idx, token_idx);
                 }
             });
         });
