@@ -85,7 +85,7 @@ void moe_swiglu_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                // Shrink SLM: 256B (Zero-padded maxes) + 16B (scale) + 16B (expert_idx) = 288 Bytes
+                // Shrink SLM: 256B (Zero-padded maxes) + 16B (scale) = 272 Bytes
                 slm_init(320);
 
                 const int loc_id = item.get_local_id(1);
@@ -94,32 +94,30 @@ void moe_swiglu_dynamic_quant_impl(
                 if (loc_id == 0) {
                     // ZERO OUT the maxes array so unused lanes don't poison the hmax reduction!
                     slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
-
-                    int left = 0;
-                    int right = total_experts_num - 1;
-                    int found_expert_idx = 0;
-                    
-                    while (left <= right) {
-                        int mid = left + (right - left) / 2;
-                        int start = experts_token_start_ptr[mid];
-                        int count = experts_token_count_ptr[mid];
-                        
-                        if (flat_idx >= start && flat_idx < start + count) {
-                            found_expert_idx = mid;
-                            break;
-                        } else if (flat_idx < start) {
-                            right = mid - 1;
-                        } else {
-                            left = mid + 1;
-                        }
-                    }
-
-                    // Store expert index at offset 272 (16-byte aligned)
-                    slm_block_store<int, 4>(272, simd<int, 4>(found_expert_idx));
                 }
-                barrier();
 
-                int expert_idx = slm_block_load<int, 4>(272)[0];
+                // OPTIMIZATION: All threads locally compute expert_idx. 
+                // Math is massively cheaper than an SLM Exchange + work-group barrier stall!
+                int left = 0;
+                int right = total_experts_num - 1;
+                int expert_idx = 0;
+                
+                while (left <= right) {
+                    int mid = left + (right - left) / 2;
+                    int start = experts_token_start_ptr[mid];
+                    int count = experts_token_count_ptr[mid];
+                    
+                    if (flat_idx >= start && flat_idx < start + count) {
+                        expert_idx = mid;
+                        break;
+                    } else if (flat_idx < start) {
+                        right = mid - 1;
+                    } else {
+                        left = mid + 1;
+                    }
+                }
+
+                // REMOVED barrier() here! Overlap Global loads with SLM initialization.
 
                 T_in* scatter_token_base = scatter_tokens_ptr + flat_idx * 2 * hidden_size;
                 T_out* output_base = quant_tokens_ptr + flat_idx * hidden_size;
@@ -151,6 +149,9 @@ void moe_swiglu_dynamic_quant_impl(
                 }
 
                 float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
+
+                // Barrier NOW, ensuring Thread 0 finished zeroing the unused SLM lanes before we scatter
+                barrier();
 
                 // Use SLM Scatter to tightly pack the array floats (4-byte spacing) without alignment faults
                 simd<uint32_t, 1> slm_offset(loc_id * sizeof(float));
@@ -399,7 +400,8 @@ void moe_scatter_dynamic_quant_impl(
                     // ZERO OUT the maxes array so unused lanes don't poison the hmax reduction!
                     slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
                 }
-                barrier();
+                
+                // REMOVED barrier() here to overlap Global memory fetches!
 
                 const int token_idx = token_k_idx / topk;
 
@@ -427,6 +429,9 @@ void moe_scatter_dynamic_quant_impl(
                 }
 
                 float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
+
+                // Barrier NOW
+                barrier();
 
                 // Use SLM Scatter to tightly pack the array floats (4-byte spacing) without alignment faults
                 simd<uint32_t, 1> slm_offset(loc_id * sizeof(float));
