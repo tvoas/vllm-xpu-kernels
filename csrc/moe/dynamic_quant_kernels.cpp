@@ -85,19 +85,12 @@ void moe_swiglu_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                // Shrink SLM: 256B (Zero-padded maxes) + 16B (scale) = 272 Bytes
-                slm_init(320);
+                // Increase SLM to handle OWORD block alignment: 64 threads * 16B = 1024B + 16B scale = 1040B
+                slm_init(1056);
 
                 const int loc_id = item.get_local_id(1);
                 const int flat_idx = item.get_group(0);
 
-                if (loc_id == 0) {
-                    // ZERO OUT the maxes array so unused lanes don't poison the hmax reduction!
-                    slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
-                }
-
-                // OPTIMIZATION: All threads locally compute expert_idx. 
-                // Math is massively cheaper than an SLM Exchange + work-group barrier stall!
                 int left = 0;
                 int right = total_experts_num - 1;
                 int expert_idx = 0;
@@ -117,23 +110,21 @@ void moe_swiglu_dynamic_quant_impl(
                     }
                 }
 
-                // REMOVED barrier() here! Overlap Global loads with SLM initialization.
-
                 T_in* scatter_token_base = scatter_tokens_ptr + flat_idx * 2 * hidden_size;
                 T_out* output_base = quant_tokens_ptr + flat_idx * hidden_size;
 
                 simd<float, CHUNK> thread_max_vec = 0.0f;
 
-                // Pass 1: Extrema tracking
+                // Pass 1: Extrema tracking (Removed Cache Hints to prevent L1 thrashing)
                 for (int bid = loc_id; bid < num_blocks; bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
                         simd<T_in, CHUNK> x1 = block_load<T_in, CHUNK>(
-                            scatter_token_base + bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            scatter_token_base + bid * BS + u * CHUNK);
                         simd<T_in, CHUNK> x2 = block_load<T_in, CHUNK>(
-                            scatter_token_base + hidden_size + bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            scatter_token_base + hidden_size + bid * BS + u * CHUNK);
                         simd<float, CHUNK> scale = block_load<float, CHUNK>(
-                            smooth_scale_ptr + expert_idx * hidden_size + bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            smooth_scale_ptr + expert_idx * hidden_size + bid * BS + u * CHUNK);
 
                         simd<float, CHUNK> x1_f = x1;
                         simd<float, CHUNK> x2_f = x2;
@@ -152,42 +143,41 @@ void moe_swiglu_dynamic_quant_impl(
 
                 float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
 
-                // Barrier NOW, ensuring Thread 0 finished zeroing the unused SLM lanes before we scatter
-                barrier();
-
-                // Use SLM Scatter to tightly pack the array floats (4-byte spacing) without alignment faults
-                simd<uint32_t, 1> slm_offset(loc_id * sizeof(float));
-                slm_scatter<float, 1>(slm_offset, simd<float, 1>(thread_max));
+                // Use SLM Block Stores array spacing for max bandwidth (16-byte aligned natively)
+                slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max));
                 barrier();
 
                 float this_token_scale = 1.0f;
 
                 if (loc_id == 0) {
-                    // Restore ultra-fast vectorized block load and 1-tick hardware max reduction!
-                    simd<float, 64> all_maxes = slm_block_load<float, 64>(0);
-                    float max_value_final = hmax<float, float, 64>(all_maxes);
+                    float max_value_final = 0.0f;
+                    // Sequentially read the scattered maxes cleanly
+                    for (int i = 0; i < wg_size; i++) {
+                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                        if (val[0] > max_value_final) max_value_final = val[0];
+                    }
 
                     float raw_token_scale = max_value_final / quant_max;
                     this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
                     
-                    // Store scale at offset 256 (16-byte aligned)
-                    slm_block_store<float, 4>(256, simd<float, 4>(this_token_scale));
+                    // Offset by 1024 perfectly maps to aligned OWORDs
+                    slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
                 }
                 barrier();
 
-                this_token_scale = slm_block_load<float, 4>(256)[0];
+                this_token_scale = slm_block_load<float, 4>(1024)[0];
                 float recip_scale = 1.0f / this_token_scale;
 
-                // Pass 2: Recompute, quantize, and store
+                // Pass 2: Recompute, quantize, and store (Removed Cache Hints)
                 for (int bid = loc_id; bid < num_blocks; bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
                         simd<T_in, CHUNK> x1 = block_load<T_in, CHUNK>(
-                            scatter_token_base + bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            scatter_token_base + bid * BS + u * CHUNK);
                         simd<T_in, CHUNK> x2 = block_load<T_in, CHUNK>(
-                            scatter_token_base + hidden_size + bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            scatter_token_base + hidden_size + bid * BS + u * CHUNK);
                         simd<float, CHUNK> scale = block_load<float, CHUNK>(
-                            smooth_scale_ptr + expert_idx * hidden_size + bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            smooth_scale_ptr + expert_idx * hidden_size + bid * BS + u * CHUNK);
 
                         simd<float, CHUNK> x1_f = x1;
                         simd<float, CHUNK> x2_f = x2;
@@ -207,7 +197,7 @@ void moe_swiglu_dynamic_quant_impl(
                         }
 
                         block_store<T_out, CHUNK>(
-                            output_base + bid * BS + u * CHUNK, scaled_swiglu_tokens_quant_out, properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
+                            output_base + bid * BS + u * CHUNK, scaled_swiglu_tokens_quant_out);
                     }
                 }
 
@@ -326,7 +316,6 @@ void moe_scatter_dynamic_quant_impl(
         int wg_size = std::min(num_blocks, 64);
 
         queue.submit([&](sycl::handler& cgh) {
-            // Depend on the newly merged routing event!
             cgh.depends_on(routing_event);
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens * topk, wg_size), sycl::range<2>(1, wg_size)),
             [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
@@ -334,23 +323,15 @@ void moe_scatter_dynamic_quant_impl(
                 const int token_k_idx = item.get_group(0);
                 const int expert_id = selected_experts_ptr[token_k_idx];
                 
-                // Prevents OOB array access on `ext_tokens_start_ptr` and block_load memory violations.
                 if (expert_id < 0 || expert_id >= n_expert_total) {
                     return;
                 }
 
-                // SLM: 256B (Zero-padded maxes) + 16B (scale) = 272 Bytes
-                slm_init(320);
+                // Increase SLM to handle OWORD block alignment: 1056B
+                slm_init(1056);
 
                 const int loc_id = item.get_local_id(1);
                 
-                if (loc_id == 0) {
-                    // ZERO OUT the maxes array so unused lanes don't poison the hmax reduction!
-                    slm_block_store<float, 64>(0, simd<float, 64>(0.0f));
-                }
-                
-                // REMOVED barrier() here to overlap Global memory fetches!
-
                 const int token_idx = token_k_idx / topk;
 
                 const int offset = token_to_scatter_offset_ptr[token_k_idx];
@@ -361,13 +342,14 @@ void moe_scatter_dynamic_quant_impl(
 
                 simd<float, CHUNK> thread_max_vec = 0.0f;
 
+                // Pass 1 (Removed Cache Hints)
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
                         simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
-                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
                         simd<float, CHUNK> scale = block_load<float, CHUNK>(
-                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
 
                         simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
                         simd<float, CHUNK> smoothed_abs = sycl::ext::intel::esimd::abs(smoothed);
@@ -378,38 +360,38 @@ void moe_scatter_dynamic_quant_impl(
 
                 float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
 
-                // Barrier NOW
-                barrier();
-
-                // Use SLM Scatter to tightly pack the array floats (4-byte spacing) without alignment faults
-                simd<uint32_t, 1> slm_offset(loc_id * sizeof(float));
-                slm_scatter<float, 1>(slm_offset, simd<float, 1>(thread_max));
+                // Use SLM Block Stores array spacing for max bandwidth (16-byte aligned natively)
+                slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max));
                 barrier();
 
                 float this_token_scale = 1.0f;
                 
                 if (loc_id == 0) {
-                    // Restore ultra-fast vectorized block load and 1-tick hardware max reduction!
-                    simd<float, 64> all_maxes = slm_block_load<float, 64>(0);
-                    float max_value_final = hmax<float, float, 64>(all_maxes);
+                    float max_value_final = 0.0f;
+                    
+                    for (int i = 0; i < wg_size; i++) {
+                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                        if (val[0] > max_value_final) max_value_final = val[0];
+                    }
 
                     float raw_token_scale = max_value_final / quant_max;
                     this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
                     
-                    slm_block_store<float, 4>(256, simd<float, 4>(this_token_scale));
+                    slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
                 }
                 barrier();
 
-                this_token_scale = slm_block_load<float, 4>(256)[0];
+                this_token_scale = slm_block_load<float, 4>(1024)[0];
                 float recip_scale = 1.0f / this_token_scale;
 
+                // Pass 2 (Removed Cache Hints)
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
                         simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
-                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
                         simd<float, CHUNK> scale = block_load<float, CHUNK>(
-                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK, properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>});
+                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
 
                         simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
 
@@ -421,12 +403,11 @@ void moe_scatter_dynamic_quant_impl(
                         }
 
                         block_store<T_out, CHUNK>(
-                            scatter_tokens_ptr + target_idx * hd_size + hd_bid * BS + u * CHUNK, quantized, properties{cache_hint_L1<cache_hint::write_back>, cache_hint_L2<cache_hint::write_back>});
+                            scatter_tokens_ptr + target_idx * hd_size + hd_bid * BS + u * CHUNK, quantized);
                     }
                 }
 
                 if (loc_id == 0) {
-                    // Restore high-bandwidth native block messaging
                     block_store<float, 1>(scatter_per_token_scale_ptr + target_idx, this_token_scale);
                     block_store<int32_t, 1>(scatter_tokens_offset_ptr + target_idx, token_idx);
                 }
