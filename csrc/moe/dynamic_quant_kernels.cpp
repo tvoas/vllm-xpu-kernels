@@ -87,7 +87,7 @@ void moe_swiglu_dynamic_quant_impl(
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
                 // Massive SLM allocation (128KB) to cache the entire FP32 row.
                 // 32000 Hidden Size fits easily.
-                slm_init(131072);
+                slm_init(32768);
 
                 const int loc_id = item.get_local_id(1);
                 const int flat_idx = item.get_group(0);
@@ -313,7 +313,7 @@ void moe_scatter_dynamic_quant_impl(
                 if (expert_id < 0 || expert_id >= n_expert_total) return;
 
                 // SLM Caching
-                slm_init(131072);
+                slm_init(32768);
 
                 const int loc_id = item.get_local_id(1);
                 const int token_idx = token_k_idx / topk;
