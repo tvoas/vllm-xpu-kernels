@@ -196,11 +196,25 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
     auto dispatch_slm = [&](auto unroll_tag) {
-        if (hidden_size <= 2048)  return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 10240>{}); // 2048 * 4 + 2048
-        if (hidden_size <= 4096)  return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 18432>{}); // 4096 * 4 + 2048
-        if (hidden_size <= 8192)  return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 34816>{}); // 8192 * 4 + 2048
-        if (hidden_size <= 16384) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 67584>{}); // 16384 * 4 + 2048
-        return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{});
+        if (hidden_size <=   128) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,   2560>{}); //   128 * 4 + 2048
+        if (hidden_size <=   256) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,   3072>{}); //   256 * 4 + 2048
+        if (hidden_size <=   512) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,   4096>{}); //   512 * 4 + 2048
+        if (hidden_size <=  1024) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,   6144>{}); //  1024 * 4 + 2048
+        if (hidden_size <=  2048) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  10240>{}); //  2048 * 4 + 2048
+        if (hidden_size <=  3072) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  14336>{}); //  3072 * 4 + 2048
+        if (hidden_size <=  4096) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  18432>{}); //  4096 * 4 + 2048
+        if (hidden_size <=  5120) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  22528>{}); //  5120 * 4 + 2048
+        if (hidden_size <=  6144) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  26624>{}); //  6144 * 4 + 2048
+        if (hidden_size <=  7168) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  30720>{}); //  7168 * 4 + 2048
+        if (hidden_size <=  8192) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  34816>{}); //  8192 * 4 + 2048
+        if (hidden_size <= 10240) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  43008>{}); // 10240 * 4 + 2048
+        if (hidden_size <= 12288) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  51200>{}); // 12288 * 4 + 2048
+        if (hidden_size <= 14336) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  59392>{}); // 14336 * 4 + 2048
+        if (hidden_size <= 16384) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  67584>{}); // 16384 * 4 + 2048
+        if (hidden_size <= 20480) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,  83968>{}); // 20480 * 4 + 2048
+        if (hidden_size <= 24576) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 100352>{}); // 24576 * 4 + 2048
+        if (hidden_size <= 28672) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 116736>{}); // 28672 * 4 + 2048
+                                  return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
     //if (hidden_size % 4096 == 0) return dispatch_slm(std::integral_constant<int, 64>{});
@@ -409,11 +423,25 @@ void moe_scatter_dynamic_quant_impl(
     };
 
     auto dispatch_slm = [&](auto unroll_tag) {
-        if (hd_size <= 2048)  return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 10240>{}); // 2048 * 4 + 2048
-        if (hd_size <= 4096)  return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 18432>{}); // 4096 * 4 + 2048
-        if (hd_size <= 8192)  return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 34816>{}); // 8192 * 4 + 2048
-        if (hd_size <= 16384) return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 67584>{}); // 16384 * 4 + 2048
-        return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 131072>{});
+        if (hd_size <=   128) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   2560>{}); //   128 * 4 + 2048
+        if (hd_size <=   256) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   3072>{}); //   256 * 4 + 2048
+        if (hd_size <=   512) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   4096>{}); //   512 * 4 + 2048
+        if (hd_size <=  1024) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   6144>{}); //  1024 * 4 + 2048
+        if (hd_size <=  2048) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  10240>{}); //  2048 * 4 + 2048
+        if (hd_size <=  3072) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  14336>{}); //  3072 * 4 + 2048
+        if (hd_size <=  4096) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  18432>{}); //  4096 * 4 + 2048
+        if (hd_size <=  5120) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  22528>{}); //  5120 * 4 + 2048
+        if (hd_size <=  6144) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  26624>{}); //  6144 * 4 + 2048
+        if (hd_size <=  7168) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  30720>{}); //  7168 * 4 + 2048
+        if (hd_size <=  8192) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  34816>{}); //  8192 * 4 + 2048
+        if (hd_size <= 10240) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  43008>{}); // 10240 * 4 + 2048
+        if (hd_size <= 12288) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  51200>{}); // 12288 * 4 + 2048
+        if (hd_size <= 14336) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  59392>{}); // 14336 * 4 + 2048
+        if (hd_size <= 16384) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  67584>{}); // 16384 * 4 + 2048
+        if (hd_size <= 20480) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  83968>{}); // 20480 * 4 + 2048
+        if (hd_size <= 24576) return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 100352>{}); // 24576 * 4 + 2048
+        if (hd_size <= 28672) return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 116736>{}); // 28672 * 4 + 2048
+                              return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
     //if (hd_size % 4096 == 0) return dispatch_slm(std::integral_constant<int, 64>{});
