@@ -72,8 +72,9 @@ void moe_swiglu_dynamic_quant_impl(
     int num_scattered = scatter_tokens.size(0);
     constexpr float quant_max = QuantMax<T_out>::value;
 
-    auto launch_swiglu = [&](auto unroll_tag) {
+    auto launch_swiglu = [&](auto unroll_tag, auto slm_tag) {
         constexpr int UNROLL = decltype(unroll_tag)::value;
+        constexpr uint32_t SLM_BYTES = decltype(slm_tag)::value;
         constexpr int CHUNK = 64;
         constexpr int BS = CHUNK * UNROLL;
 
@@ -85,9 +86,7 @@ void moe_swiglu_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                // Massive SLM allocation (128KB) to cache the entire FP32 row.
-                // 32000 Hidden Size fits easily.
-                slm_init(32768);
+                slm_init(SLM_BYTES); // Constexpr literal statically passed to compiler
 
                 const int loc_id = item.get_local_id(1);
                 const int flat_idx = item.get_group(0);
@@ -196,13 +195,21 @@ void moe_swiglu_dynamic_quant_impl(
         });
     };
 
-    //if (hidden_size % 4096 == 0) return launch_swiglu(std::integral_constant<int, 64>{});
-    //if (hidden_size % 2048 == 0) return launch_swiglu(std::integral_constant<int, 32>{});
-    //if (hidden_size % 1024 == 0) return launch_swiglu(std::integral_constant<int, 16>{});
-    //if (hidden_size %  512 == 0) return launch_swiglu(std::integral_constant<int, 8>{});
-    //if (hidden_size %  256 == 0) return launch_swiglu(std::integral_constant<int, 4>{});
-    //if (hidden_size %  128 == 0) return launch_swiglu(std::integral_constant<int, 2>{});
-                                 return launch_swiglu(std::integral_constant<int, 1>{});
+    auto dispatch_slm = [&](auto unroll_tag) {
+        if (hidden_size <= 2048)  return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 10240>{}); // 2048 * 4 + 2048
+        if (hidden_size <= 4096)  return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 18432>{}); // 4096 * 4 + 2048
+        if (hidden_size <= 8192)  return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 34816>{}); // 8192 * 4 + 2048
+        if (hidden_size <= 16384) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 67584>{}); // 16384 * 4 + 2048
+        return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{});
+    };
+
+    //if (hidden_size % 4096 == 0) return dispatch_slm(std::integral_constant<int, 64>{});
+    //if (hidden_size % 2048 == 0) return dispatch_slm(std::integral_constant<int, 32>{});
+    //if (hidden_size % 1024 == 0) return dispatch_slm(std::integral_constant<int, 16>{});
+    //if (hidden_size %  512 == 0) return dispatch_slm(std::integral_constant<int, 8>{});
+    //if (hidden_size %  256 == 0) return dispatch_slm(std::integral_constant<int, 4>{});
+    //if (hidden_size %  128 == 0) return dispatch_slm(std::integral_constant<int, 2>{});
+                                 return dispatch_slm(std::integral_constant<int, 1>{});
 }
 
 template <typename T_in, typename T_out>
@@ -295,8 +302,9 @@ void moe_scatter_dynamic_quant_impl(
     auto scatter_tokens_offset_ptr = scatter_tokens_offset.data_ptr<int32_t>();
 
     // Pass 3: Gather, quantize, and scatter
-    auto launch_scatter = [&](auto unroll_tag) {
+    auto launch_scatter = [&](auto unroll_tag, auto slm_tag) {
         constexpr int UNROLL = decltype(unroll_tag)::value;
+        constexpr uint32_t SLM_BYTES = decltype(slm_tag)::value;
         constexpr int CHUNK = 64;
         constexpr int BS = CHUNK * UNROLL;
 
@@ -313,7 +321,7 @@ void moe_scatter_dynamic_quant_impl(
                 if (expert_id < 0 || expert_id >= n_expert_total) return;
 
                 // SLM Caching
-                slm_init(32768);
+                slm_init(SLM_BYTES); // Constexpr literal statically passed to compiler
 
                 const int loc_id = item.get_local_id(1);
                 const int token_idx = token_k_idx / topk;
@@ -400,13 +408,21 @@ void moe_scatter_dynamic_quant_impl(
         });
     };
 
-    //if (hd_size % 4096 == 0) return launch_scatter(std::integral_constant<int, 64>{});
-    //if (hd_size % 2048 == 0) return launch_scatter(std::integral_constant<int, 32>{});
-    //if (hd_size % 1024 == 0) return launch_scatter(std::integral_constant<int, 16>{});
-    //if (hd_size %  512 == 0) return launch_scatter(std::integral_constant<int, 8>{});
-    //if (hd_size %  256 == 0) return launch_scatter(std::integral_constant<int, 4>{});
-    //if (hd_size %  128 == 0) return launch_scatter(std::integral_constant<int, 2>{});
-                             return launch_scatter(std::integral_constant<int, 1>{});
+    auto dispatch_slm = [&](auto unroll_tag) {
+        if (hd_size <= 2048)  return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 10240>{}); // 2048 * 4 + 2048
+        if (hd_size <= 4096)  return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 18432>{}); // 4096 * 4 + 2048
+        if (hd_size <= 8192)  return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 34816>{}); // 8192 * 4 + 2048
+        if (hd_size <= 16384) return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 67584>{}); // 16384 * 4 + 2048
+        return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 131072>{});
+    };
+
+    //if (hd_size % 4096 == 0) return dispatch_slm(std::integral_constant<int, 64>{});
+    //if (hd_size % 2048 == 0) return dispatch_slm(std::integral_constant<int, 32>{});
+    //if (hd_size % 1024 == 0) return dispatch_slm(std::integral_constant<int, 16>{});
+    //if (hd_size %  512 == 0) return dispatch_slm(std::integral_constant<int, 8>{});
+    //if (hd_size %  256 == 0) return dispatch_slm(std::integral_constant<int, 4>{});
+    //if (hd_size %  128 == 0) return dispatch_slm(std::integral_constant<int, 2>{});
+                             return dispatch_slm(std::integral_constant<int, 1>{});
 }
 
 // Outer dispatch macros to select implementation
