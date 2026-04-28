@@ -208,12 +208,29 @@ void moe_swiglu_dynamic_quant_impl(
         });
     };
 
+    // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
+    int target_wg = 1; 
+    
+    int num_chunks = hidden_size / 64;
+    int best_unroll = 1;
 
-    if (hidden_size % 1024 == 0 && (hidden_size / 1024) >= 8) return launch_swiglu(std::integral_constant<int, 16>{});
-    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 8) return launch_swiglu(std::integral_constant<int, 8>{});
-    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 8) return launch_swiglu(std::integral_constant<int, 4>{});
-    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 8) return launch_swiglu(std::integral_constant<int, 2>{});
-                                                              return launch_swiglu(std::integral_constant<int, 1>{});
+    // Find the largest UNROLL that cleanly divides memory AND 
+    // preserves enough active blocks to meet target_wg.
+    for (int u : {32, 16, 8, 4, 2}) {
+        if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
+            best_unroll = u;
+            break;
+        }
+    }
+
+    switch (best_unroll) {
+        case 32: return launch_swiglu(std::integral_constant<int, 32>{});
+        case 16: return launch_swiglu(std::integral_constant<int, 16>{});
+        case 8:  return launch_swiglu(std::integral_constant<int, 8>{});
+        case 4:  return launch_swiglu(std::integral_constant<int, 4>{});
+        case 2:  return launch_swiglu(std::integral_constant<int, 2>{});
+        default: return launch_swiglu(std::integral_constant<int, 1>{});
+    }
 }
 
 template <typename T_in, typename T_out>
@@ -414,13 +431,29 @@ void moe_scatter_dynamic_quant_impl(
         });
     };
 
+    // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
+    int target_wg = 1; 
+    
+    int num_chunks = hd_size / 64;
+    int best_unroll = 1;
 
-    if (hd_size % 2048 == 0 && (hd_size / 2048) >= 3) return launch_scatter(std::integral_constant<int, 32>{});
-    if (hd_size % 1024 == 0 && (hd_size / 1024) >= 3) return launch_scatter(std::integral_constant<int, 16>{});
-    if (hd_size %  512 == 0 && (hd_size /  512) >= 2) return launch_scatter(std::integral_constant<int, 8>{});
-    if (hd_size %  256 == 0 && (hd_size /  256) >= 2) return launch_scatter(std::integral_constant<int, 4>{});
-    if (hd_size %  128 == 0 && (hd_size /  128) >= 2) return launch_scatter(std::integral_constant<int, 2>{});
-                                                      return launch_scatter(std::integral_constant<int, 1>{});
+    // Find the largest UNROLL that cleanly divides memory AND 
+    // preserves enough active blocks to meet target_wg.
+    for (int u : {32, 16, 8, 4, 2}) {
+        if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
+            best_unroll = u;
+            break;
+        }
+    }
+
+    switch (best_unroll) {
+        case 32: return launch_scatter(std::integral_constant<int, 32>{});
+        case 16: return launch_scatter(std::integral_constant<int, 16>{});
+        case 8:  return launch_scatter(std::integral_constant<int, 8>{});
+        case 4:  return launch_scatter(std::integral_constant<int, 4>{});
+        case 2:  return launch_scatter(std::integral_constant<int, 2>{});
+        default: return launch_scatter(std::integral_constant<int, 1>{});
+    }
 }
 
 // Outer dispatch macros to select implementation
