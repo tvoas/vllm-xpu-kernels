@@ -218,7 +218,7 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
     // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
-    int target_wg = 1; 
+    int target_wg = 2; 
     
     int num_chunks = hidden_size / 64;
     int best_unroll = 1;
@@ -458,7 +458,7 @@ void moe_scatter_dynamic_quant_impl(
     };
 
     // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
-    int target_wg = 1; 
+    int target_wg = 2; 
     
     int num_chunks = hd_size / 64;
     int best_unroll = 1;
