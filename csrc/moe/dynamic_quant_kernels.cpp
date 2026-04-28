@@ -218,14 +218,14 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
     // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
-    int target_wg = 64; 
+    int target_wg = 1; 
     
     int num_chunks = hidden_size / 64;
     int best_unroll = 1;
 
     // Find the largest UNROLL that cleanly divides memory AND 
     // preserves enough active blocks to meet target_wg.
-    for (int u : {8, 4, 2}) {
+    for (int u : {4, 2}) {
         if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
             best_unroll = u;
             break;
@@ -233,7 +233,6 @@ void moe_swiglu_dynamic_quant_impl(
     }
 
     switch (best_unroll) {
-        case 8:  return dispatch_slm(std::integral_constant<int, 8>{});
         case 4:  return dispatch_slm(std::integral_constant<int, 4>{});
         case 2:  return dispatch_slm(std::integral_constant<int, 2>{});
         default: return dispatch_slm(std::integral_constant<int, 1>{});
@@ -459,14 +458,14 @@ void moe_scatter_dynamic_quant_impl(
     };
 
     // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
-    int target_wg = 64; 
+    int target_wg = 1; 
     
     int num_chunks = hd_size / 64;
     int best_unroll = 1;
 
     // Find the largest UNROLL that cleanly divides memory AND 
     // preserves enough active blocks to meet target_wg.
-    for (int u : {8, 4, 2}) {
+    for (int u : {4, 2}) {
         if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
             best_unroll = u;
             break;
@@ -474,7 +473,6 @@ void moe_scatter_dynamic_quant_impl(
     }
 
     switch (best_unroll) {
-        case 8:  return dispatch_slm(std::integral_constant<int, 8>{});
         case 4:  return dispatch_slm(std::integral_constant<int, 4>{});
         case 2:  return dispatch_slm(std::integral_constant<int, 2>{});
         default: return dispatch_slm(std::integral_constant<int, 1>{});
