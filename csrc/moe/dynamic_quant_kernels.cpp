@@ -209,10 +209,10 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
 
-    if (hidden_size % 1024 == 0 && (hidden_size / 1024) >= 2) return launch_swiglu(std::integral_constant<int, 16>{});
-    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 2) return launch_swiglu(std::integral_constant<int, 8>{});
-    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 2) return launch_swiglu(std::integral_constant<int, 4>{});
-    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 2) return launch_swiglu(std::integral_constant<int, 2>{});
+    if (hidden_size % 1024 == 0 && (hidden_size / 1024) >= 3) return launch_swiglu(std::integral_constant<int, 16>{});
+    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 3) return launch_swiglu(std::integral_constant<int, 8>{});
+    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 3) return launch_swiglu(std::integral_constant<int, 4>{});
+    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 3) return launch_swiglu(std::integral_constant<int, 2>{});
                                                               return launch_swiglu(std::integral_constant<int, 1>{});
 }
 
@@ -415,10 +415,10 @@ void moe_scatter_dynamic_quant_impl(
     };
 
 
-    if (hd_size % 1024 == 0 && (hd_size / 1024) >= 2) return launch_scatter(std::integral_constant<int, 16>{});
-    if (hd_size %  512 == 0 && (hd_size /  512) >= 2) return launch_scatter(std::integral_constant<int, 8>{});
-    if (hd_size %  256 == 0 && (hd_size /  256) >= 2) return launch_scatter(std::integral_constant<int, 4>{});
-    if (hd_size %  128 == 0 && (hd_size /  128) >= 2) return launch_scatter(std::integral_constant<int, 2>{});
+    if (hd_size % 1024 == 0 && (hd_size / 1024) >= 3) return launch_scatter(std::integral_constant<int, 16>{});
+    if (hd_size %  512 == 0 && (hd_size /  512) >= 3) return launch_scatter(std::integral_constant<int, 8>{});
+    if (hd_size %  256 == 0 && (hd_size /  256) >= 3) return launch_scatter(std::integral_constant<int, 4>{});
+    if (hd_size %  128 == 0 && (hd_size /  128) >= 3) return launch_scatter(std::integral_constant<int, 2>{});
                                                       return launch_scatter(std::integral_constant<int, 1>{});
 }
 
