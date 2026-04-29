@@ -217,10 +217,10 @@ void moe_swiglu_dynamic_quant_impl(
                                   return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
-    if (hidden_size % 1024 == 0 && (hidden_size / 1024) >= 3) return dispatch_slm(std::integral_constant<int, 16>{});
-    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 3) return dispatch_slm(std::integral_constant<int, 8>{});
-    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 3) return dispatch_slm(std::integral_constant<int, 4>{});
-    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 3) return dispatch_slm(std::integral_constant<int, 2>{});
+    if (hidden_size % 1024 == 0 && (hidden_size / 1024) >= 5) return dispatch_slm(std::integral_constant<int, 16>{});
+    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 5) return dispatch_slm(std::integral_constant<int, 8>{});
+    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 5) return dispatch_slm(std::integral_constant<int, 4>{});
+    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 5) return dispatch_slm(std::integral_constant<int, 2>{});
                                                               return dispatch_slm(std::integral_constant<int, 1>{});
 }
 
@@ -442,10 +442,10 @@ void moe_scatter_dynamic_quant_impl(
                               return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
-    if (hd_size % 1024 == 0 && (hd_size / 1024) >= 4) return dispatch_slm(std::integral_constant<int, 16>{});
-    if (hd_size %  512 == 0 && (hd_size /  512) >= 4) return dispatch_slm(std::integral_constant<int, 8>{});
-    if (hd_size %  256 == 0 && (hd_size /  256) >= 4) return dispatch_slm(std::integral_constant<int, 4>{});
-    if (hd_size %  128 == 0 && (hd_size /  128) >= 4) return dispatch_slm(std::integral_constant<int, 2>{});
+    if (hd_size % 1024 == 0 && (hd_size / 1024) >= 5) return dispatch_slm(std::integral_constant<int, 16>{});
+    if (hd_size %  512 == 0 && (hd_size /  512) >= 5) return dispatch_slm(std::integral_constant<int, 8>{});
+    if (hd_size %  256 == 0 && (hd_size /  256) >= 5) return dispatch_slm(std::integral_constant<int, 4>{});
+    if (hd_size %  128 == 0 && (hd_size /  128) >= 5) return dispatch_slm(std::integral_constant<int, 2>{});
                                                       return dispatch_slm(std::integral_constant<int, 1>{});
 }
 
