@@ -209,8 +209,11 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
 
-    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 16) return launch_swiglu(std::integral_constant<int, 4>{});
-    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 16) return launch_swiglu(std::integral_constant<int, 2>{});
+    if (hidden_size % 2048 == 0 && (hidden_size / 2048) >= 2) return launch_swiglu(std::integral_constant<int, 32>{});
+    if (hidden_size % 1024 == 0 && (hidden_size / 1024) >= 2) return launch_swiglu(std::integral_constant<int, 16>{});
+    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 2) return launch_swiglu(std::integral_constant<int, 8>{});
+    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 2) return launch_swiglu(std::integral_constant<int, 4>{});
+    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 2) return launch_swiglu(std::integral_constant<int, 2>{});
                                                               return launch_swiglu(std::integral_constant<int, 1>{});
 }
 
@@ -251,24 +254,38 @@ void moe_scatter_dynamic_quant_impl(
     auto ext_tokens_start_ptr = experts_token_start.data_ptr<int32_t>();
     auto token_to_scatter_offset_ptr = token_to_scatter_offset.data_ptr<int32_t>();
 
+    int total_items = n_tokens * topk;
+    
+    constexpr int sub_group_snap = 8;
+    constexpr int items_per_thread = 1;
+    constexpr int max_routing_wg = 256;
+
+    // 1. Calculate raw threads needed
+    int target_threads = (total_items + items_per_thread - 1) / items_per_thread;
+    
+    // 2. Round up to the nearest multiple of the subgroup size
+    int routing_wg = ((target_threads + sub_group_snap - 1) / sub_group_snap) * sub_group_snap;
+    
+    // 3. Clamp safely between min subgroup size and max allowable WG size
+    routing_wg = std::min(max_routing_wg, std::max(sub_group_snap, routing_wg));
+
     // UNIFIED ROUTING PASS: Replaces Pass 0, Pass 1, and Pass 2, eliminating two 
     // kernel launch overheads (~15us+ saved) and all global atomics.
     auto routing_event = queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int32_t, 1> local_expert_counts(n_expert_total, cgh);
         
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)), 
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(routing_wg), sycl::range<1>(routing_wg)), 
         [=](sycl::nd_item<1> item) [[intel::kernel_args_restrict]] {
             int lid = item.get_local_id(0);
             
             // 1. Zero out SLM histogram
-            for (int i = lid; i < n_expert_total; i += 256) {
+            for (int i = lid; i < n_expert_total; i += routing_wg) {
                 local_expert_counts[i] = 0;
             }
             item.barrier(sycl::access::fence_space::local_space);
 
             // 2. Count tokens using rapid SLM atomics
-            int total_items = n_tokens * topk;
-            for (int i = lid; i < total_items; i += 256) {
+            for (int i = lid; i < total_items; i += routing_wg) {
                 int expert_id = selected_experts_ptr[i];
                 if (expert_id >= 0 && expert_id < n_expert_total) {
                     sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>
@@ -413,8 +430,11 @@ void moe_scatter_dynamic_quant_impl(
     };
 
 
-    if (hd_size %  256 == 0 && (hd_size /  256) >= 16) return launch_scatter(std::integral_constant<int, 4>{});
-    if (hd_size %  128 == 0 && (hd_size /  128) >= 16) return launch_scatter(std::integral_constant<int, 2>{});
+    if (hd_size % 2048 == 0 && (hd_size / 2048) >= 2) return launch_scatter(std::integral_constant<int, 32>{});
+    if (hd_size % 1024 == 0 && (hd_size / 1024) >= 2) return launch_scatter(std::integral_constant<int, 16>{});
+    if (hd_size %  512 == 0 && (hd_size /  512) >= 2) return launch_scatter(std::integral_constant<int, 8>{});
+    if (hd_size %  256 == 0 && (hd_size /  256) >= 2) return launch_scatter(std::integral_constant<int, 4>{});
+    if (hd_size %  128 == 0 && (hd_size /  128) >= 2) return launch_scatter(std::integral_constant<int, 2>{});
                                                       return launch_scatter(std::integral_constant<int, 1>{});
 }
 
