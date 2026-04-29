@@ -257,7 +257,7 @@ void moe_scatter_dynamic_quant_impl(
     int total_items = n_tokens * topk;
     
     constexpr int sub_group_snap = 32;
-    constexpr int items_per_thread = 8;
+    constexpr int items_per_thread = 12;
     constexpr int max_routing_wg = 256;
 
     // 1. Calculate raw threads needed
