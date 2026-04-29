@@ -209,9 +209,9 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
 
-    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 10) return launch_swiglu(std::integral_constant<int, 8>{});
-    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 10) return launch_swiglu(std::integral_constant<int, 4>{});
-    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 10) return launch_swiglu(std::integral_constant<int, 2>{});
+    if (hidden_size %  512 == 0 && (hidden_size /  512) >= 12) return launch_swiglu(std::integral_constant<int, 8>{});
+    if (hidden_size %  256 == 0 && (hidden_size /  256) >= 12) return launch_swiglu(std::integral_constant<int, 4>{});
+    if (hidden_size %  128 == 0 && (hidden_size /  128) >= 12) return launch_swiglu(std::integral_constant<int, 2>{});
                                                               return launch_swiglu(std::integral_constant<int, 1>{});
 }
 
@@ -414,9 +414,9 @@ void moe_scatter_dynamic_quant_impl(
     };
 
 
-    if (hd_size %  512 == 0 && (hd_size /  512) >= 10) return launch_scatter(std::integral_constant<int, 8>{});
-    if (hd_size %  256 == 0 && (hd_size /  256) >= 10) return launch_scatter(std::integral_constant<int, 4>{});
-    if (hd_size %  128 == 0 && (hd_size /  128) >= 10) return launch_scatter(std::integral_constant<int, 2>{});
+    if (hd_size %  512 == 0 && (hd_size /  512) >= 12) return launch_scatter(std::integral_constant<int, 8>{});
+    if (hd_size %  256 == 0 && (hd_size /  256) >= 12) return launch_scatter(std::integral_constant<int, 4>{});
+    if (hd_size %  128 == 0 && (hd_size /  128) >= 12) return launch_scatter(std::integral_constant<int, 2>{});
                                                       return launch_scatter(std::integral_constant<int, 1>{});
 }
 
