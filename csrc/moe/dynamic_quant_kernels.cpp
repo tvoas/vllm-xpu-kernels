@@ -9,6 +9,7 @@
 #include <sycl/ext/oneapi/bfloat16.hpp>
 #include <c10/core/DeviceGuard.h>
 #include <string>
+#include <algorithm>
 
 using namespace sycl::ext::intel::esimd;
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -39,7 +40,7 @@ inline simd<uint8_t, N> fast_cvt_float_to_e4m3fn(simd<float, N> x) {
 }
 
 // ----------------------------------------------------------------------------
-// SCATTER IMPLEMENTATIONS (V16/17 GLOBAL, V14/18 SLM, V20 TUNED ROUTING)
+// SCATTER IMPLEMENTATIONS
 // ----------------------------------------------------------------------------
 template <typename T_in, typename T_out>
 void moe_scatter_dynamic_quant_impl(
@@ -73,7 +74,6 @@ void moe_scatter_dynamic_quant_impl(
 
     int total_items = n_tokens * topk;
 
-    // V20 Dynamic Routing Values (Defaults)
     int sub_group_snap = 32;
     int items_per_thread = 32;
     bool use_v20_routing = false;
@@ -151,7 +151,8 @@ void moe_scatter_dynamic_quant_impl(
                         simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
                         simd<float, CHUNK> scale = block_load<float, CHUNK>(smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
                         simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
-                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(smoothed));
+                        simd<float, CHUNK> smoothed_abs = sycl::ext::intel::esimd::abs(smoothed);
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, smoothed_abs);
                     }
                 }
                 slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(hmax<float, float, CHUNK>(thread_max_vec)));
@@ -180,8 +181,11 @@ void moe_scatter_dynamic_quant_impl(
                         simd<float, CHUNK> scale = block_load<float, CHUNK>(smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
                         simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
                         simd<T_out, CHUNK> quantized;
-                        if constexpr (std::is_same_v<T_out, int8_t>) quantized = rnde<float>(smoothed * recip_scale);
-                        else quantized = fast_cvt_float_to_e4m3fn<CHUNK>(smoothed * recip_scale);
+                        if constexpr (std::is_same_v<T_out, int8_t>) {
+                            quantized = rnde<float>(smoothed * recip_scale);
+                        } else {
+                            quantized = fast_cvt_float_to_e4m3fn<CHUNK>(smoothed * recip_scale);
+                        }
                         block_store<T_out, CHUNK>(scatter_tokens_ptr + target_idx * hd_size + hd_bid * BS + u * CHUNK, quantized);
                     }
                 }
@@ -250,14 +254,17 @@ void moe_scatter_dynamic_quant_impl(
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
                         uint32_t base_offset = (hd_bid * BS + u * CHUNK) * 4;
-                        simd<float, CHUNK> cached;
+                        simd<float, CHUNK> cached_smoothed;
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
-                            cached.template select<16, 1>(i * 16) = slm_block_load<float, 16>(base_offset + i * 64);
+                            cached_smoothed.template select<16, 1>(i * 16) = slm_block_load<float, 16>(base_offset + i * 64);
                         }
                         simd<T_out, CHUNK> quantized;
-                        if constexpr (std::is_same_v<T_out, int8_t>) quantized = rnde<float>(cached * recip_scale);
-                        else quantized = fast_cvt_float_to_e4m3fn<CHUNK>(cached * recip_scale);
+                        if constexpr (std::is_same_v<T_out, int8_t>) {
+                            quantized = rnde<float>(cached_smoothed * recip_scale);
+                        } else {
+                            quantized = fast_cvt_float_to_e4m3fn<CHUNK>(cached_smoothed * recip_scale);
+                        }
                         block_store<T_out, CHUNK>(scatter_tokens_ptr + target_idx * hd_size + hd_bid * BS + u * CHUNK, quantized);
                     }
                 }
@@ -275,13 +282,22 @@ void moe_scatter_dynamic_quant_impl(
         if (hd_size <=   512) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,   4096>{});
         if (hd_size <=  1024) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,   6144>{});
         if (hd_size <=  2048) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  10240>{});
+        if (hd_size <=  3072) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  14336>{});
         if (hd_size <=  4096) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  18432>{});
+        if (hd_size <=  5120) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  22528>{});
+        if (hd_size <=  6144) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  26624>{});
+        if (hd_size <=  7168) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  30720>{});
         if (hd_size <=  8192) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  34816>{});
+        if (hd_size <= 10240) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  43008>{});
+        if (hd_size <= 12288) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  51200>{});
+        if (hd_size <= 14336) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  59392>{});
         if (hd_size <= 16384) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  67584>{});
-        return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t, 131072>{});
+        if (hd_size <= 20480) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t,  83968>{});
+        if (hd_size <= 24576) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t, 100352>{});
+        if (hd_size <= 28672) return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t, 116736>{});
+                              return launch_scatter_slm(unroll_tag, std::integral_constant<uint32_t, 131072>{});
     };
 
-    // Fast mapping based on the heuristical names
     int best_unroll = 1;
     bool is_slm = false;
     
@@ -296,7 +312,10 @@ void moe_scatter_dynamic_quant_impl(
     else if (chosen_case.find("02") != std::string::npos) best_unroll = 2;
     else best_unroll = 1;
 
-    // Dispatch
+    while (best_unroll > 1 && (hd_size / (64 * best_unroll)) <= 0) {
+        best_unroll /= 2;
+    }
+
     if (is_slm) {
         switch (best_unroll) {
             case 16: return dispatch_scatter_slm(std::integral_constant<int, 16>{});
@@ -317,9 +336,8 @@ void moe_scatter_dynamic_quant_impl(
     }
 }
 
-
 // ----------------------------------------------------------------------------
-// SWIGLU IMPLEMENTATIONS (V17 GLOBAL, V18 SLM)
+// SWIGLU IMPLEMENTATIONS
 // ----------------------------------------------------------------------------
 template <typename T_in, typename T_out>
 void moe_swiglu_dynamic_quant_impl(
@@ -378,7 +396,8 @@ void moe_swiglu_dynamic_quant_impl(
 
                         simd<float, CHUNK> sigmoid = sycl::ext::intel::esimd::inv(1.0f + sycl::ext::intel::esimd::exp(-simd<float, CHUNK>(x1)));
                         simd<float, CHUNK> swiglu_tokens = (simd<float, CHUNK>(x1) * sigmoid) * simd<float, CHUNK>(x2);
-                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(swiglu_tokens * scale));
+                        simd<float, CHUNK> scaled_swiglu_tokens = swiglu_tokens * scale;
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(scaled_swiglu_tokens));
                     }
                 }
                 slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(hmax<float, float, CHUNK>(thread_max_vec)));
@@ -411,8 +430,11 @@ void moe_swiglu_dynamic_quant_impl(
                         simd<float, CHUNK> scaled_swiglu_tokens = (simd<float, CHUNK>(x1) * sigmoid) * simd<float, CHUNK>(x2) * scale;
                         
                         simd<T_out, CHUNK> quantized;
-                        if constexpr (std::is_same_v<T_out, int8_t>) quantized = rnde<float>(scaled_swiglu_tokens * recip_scale);
-                        else quantized = fast_cvt_float_to_e4m3fn<CHUNK>(scaled_swiglu_tokens * recip_scale);
+                        if constexpr (std::is_same_v<T_out, int8_t>) {
+                            quantized = rnde<float>(scaled_swiglu_tokens * recip_scale);
+                        } else {
+                            quantized = fast_cvt_float_to_e4m3fn<CHUNK>(scaled_swiglu_tokens * recip_scale);
+                        }
                         block_store<T_out, CHUNK>(output_base + bid * BS + u * CHUNK, quantized);
                     }
                 }
@@ -457,12 +479,12 @@ void moe_swiglu_dynamic_quant_impl(
                         simd<T_in, CHUNK> x2 = block_load<T_in, CHUNK>(scatter_token_base + hidden_size + bid * BS + u * CHUNK);
                         simd<float, CHUNK> scale = block_load<float, CHUNK>(smooth_scale_ptr + expert_idx * hidden_size + bid * BS + u * CHUNK);
                         simd<float, CHUNK> sigmoid = sycl::ext::intel::esimd::inv(1.0f + sycl::ext::intel::esimd::exp(-simd<float, CHUNK>(x1)));
-                        simd<float, CHUNK> scaled_swiglu = (simd<float, CHUNK>(x1) * sigmoid) * simd<float, CHUNK>(x2) * scale;
-                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(scaled_swiglu));
+                        simd<float, CHUNK> scaled_swiglu_tokens = (simd<float, CHUNK>(x1) * sigmoid) * simd<float, CHUNK>(x2) * scale;
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(scaled_swiglu_tokens));
                         uint32_t base_offset = (bid * BS + u * CHUNK) * 4;
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
-                            slm_block_store<float, 16>(base_offset + i * 64, scaled_swiglu.template select<16, 1>(i * 16));
+                            slm_block_store<float, 16>(base_offset + i * 64, scaled_swiglu_tokens.template select<16, 1>(i * 16));
                         }
                     }
                 }
@@ -489,15 +511,18 @@ void moe_swiglu_dynamic_quant_impl(
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
                         uint32_t base_offset = (bid * BS + u * CHUNK) * 4;
-                        simd<float, CHUNK> cached;
+                        simd<float, CHUNK> cached_tokens;
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
-                            cached.template select<16, 1>(i * 16) = slm_block_load<float, 16>(base_offset + i * 64);
+                            cached_tokens.template select<16, 1>(i * 16) = slm_block_load<float, 16>(base_offset + i * 64);
                         }
-                        simd<T_out, CHUNK> quantized;
-                        if constexpr (std::is_same_v<T_out, int8_t>) quantized = rnde<float>(cached * recip_scale);
-                        else quantized = fast_cvt_float_to_e4m3fn<CHUNK>(cached * recip_scale);
-                        block_store<T_out, CHUNK>(output_base + bid * BS + u * CHUNK, quantized);
+                        simd<T_out, CHUNK> quantized_out;
+                        if constexpr (std::is_same_v<T_out, int8_t>) {
+                            quantized_out = rnde<float>(cached_tokens * recip_scale);
+                        } else {
+                            quantized_out = fast_cvt_float_to_e4m3fn<CHUNK>(cached_tokens * recip_scale);
+                        }
+                        block_store<T_out, CHUNK>(output_base + bid * BS + u * CHUNK, quantized_out);
                     }
                 }
                 if (loc_id == 0) block_store<float, 1>(per_token_scale_ptr + flat_idx, this_token_scale);
@@ -511,10 +536,20 @@ void moe_swiglu_dynamic_quant_impl(
         if (hidden_size <=   512) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,   4096>{});
         if (hidden_size <=  1024) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,   6144>{});
         if (hidden_size <=  2048) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  10240>{});
+        if (hidden_size <=  3072) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  14336>{});
         if (hidden_size <=  4096) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  18432>{});
+        if (hidden_size <=  5120) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  22528>{});
+        if (hidden_size <=  6144) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  26624>{});
+        if (hidden_size <=  7168) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  30720>{});
         if (hidden_size <=  8192) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  34816>{});
+        if (hidden_size <= 10240) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  43008>{});
+        if (hidden_size <= 12288) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  51200>{});
+        if (hidden_size <= 14336) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  59392>{});
         if (hidden_size <= 16384) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  67584>{});
-        return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t, 131072>{});
+        if (hidden_size <= 20480) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t,  83968>{});
+        if (hidden_size <= 24576) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t, 100352>{});
+        if (hidden_size <= 28672) return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t, 116736>{});
+                                  return launch_swiglu_slm(unroll_tag, std::integral_constant<uint32_t, 131072>{});
     };
 
     int best_unroll = 1;
@@ -528,6 +563,10 @@ void moe_swiglu_dynamic_quant_impl(
     else if (chosen_case.find("04") != std::string::npos) best_unroll = 4;
     else if (chosen_case.find("02") != std::string::npos) best_unroll = 2;
     else best_unroll = 1;
+
+    while (best_unroll > 1 && (hidden_size / (64 * best_unroll)) <= 0) {
+        best_unroll /= 2;
+    }
 
     if (is_slm) {
         switch (best_unroll) {
@@ -549,7 +588,6 @@ void moe_swiglu_dynamic_quant_impl(
         }
     }
 }
-
 
 // ----------------------------------------------------------------------------
 // DISPATCH MACROS & API SHIMS 
@@ -579,8 +617,7 @@ void moe_swiglu_dynamic_quant(
 
     int num_tokens = num_scattered; 
 
-    // Auto-Generated Dispatch Logic 
-    std::string chosen_case = "reports_test_170801"; // Fallback default
+    std::string chosen_case = "reports_test_170801"; 
     if ((hidden_size >= 1365 && hidden_size < 7646) && (num_tokens >= 341 && num_tokens < 1365)) {
         chosen_case = "reports_test_180802";
     }
@@ -640,8 +677,7 @@ void moe_scatter_dynamic_quant(
     int hidden_size = hd_size;
     int num_tokens = n_tokens;
 
-    // Auto-Generated Dispatch Logic 
-    std::string chosen_case = "reports_test_161601"; // Fallback default
+    std::string chosen_case = "reports_test_161601";
     if ((hidden_size >= 5213 && hidden_size < 7646) && (num_tokens >= 53 && num_tokens < 1365) && (topk < 3)) {
         chosen_case = "reports_test_141606";
     }
