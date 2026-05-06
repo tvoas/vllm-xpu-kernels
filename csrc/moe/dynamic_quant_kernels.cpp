@@ -617,39 +617,13 @@ void moe_swiglu_dynamic_quant(
 
     int num_tokens = num_scattered; 
 
-    std::string chosen_case = "reports_test_170801"; 
-    if ((hidden_size >= 1365 && hidden_size < 7646) && (num_tokens >= 341 && num_tokens < 1365)) {
-        chosen_case = "reports_test_180802";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens < 341)) {
-        chosen_case = "reports_test_180802";
-    }
-    else if ((hidden_size >= 5213) && (num_tokens >= 53 && num_tokens < 341)) {
-        chosen_case = "reports_test_180808";
-    }
-    else if ((hidden_size < 2731) && (num_tokens < 98)) {
+    std::string chosen_case = "reports_test_180802"; 
+    if (hidden_size < 2731) {
         chosen_case = "reports_test_181604";
-    }
-    else if ((hidden_size < 1365) && (num_tokens >= 683)) {
+    } else if (hidden_size >= 7646) {
         chosen_case = "reports_test_170801";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 98 && num_tokens < 341)) {
-        chosen_case = "reports_test_180401";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 7646) && (num_tokens >= 1365)) {
-        chosen_case = "reports_test_173204";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens < 53)) {
-        chosen_case = "reports_test_173216";
-    }
-    else if ((hidden_size < 1365) && (num_tokens >= 98 && num_tokens < 683)) {
-        chosen_case = "reports_test_180404";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 341)) {
-        chosen_case = "reports_test_171601";
-    }
-    else if ((hidden_size >= 5213 && hidden_size < 7646) && (num_tokens < 53)) {
-        chosen_case = "reports_test_183208";
+    } else {
+        chosen_case = "reports_test_180802";
     }
 
     auto in_dtype = scatter_tokens.scalar_type();
@@ -677,126 +651,14 @@ void moe_scatter_dynamic_quant(
     int hidden_size = hd_size;
     int num_tokens = n_tokens;
 
-    std::string chosen_case = "reports_test_161601";
-    if ((hidden_size >= 5213 && hidden_size < 7646) && (num_tokens >= 53 && num_tokens < 1365) && (topk < 3)) {
-        chosen_case = "reports_test_141606";
-    }
-    else if ((hidden_size >= 5213 && hidden_size < 7646) && (num_tokens >= 53 && num_tokens < 2731) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_181602";
-    }
-    else if ((hidden_size >= 5213 && hidden_size < 7646) && (num_tokens >= 1365) && (topk < 3)) {
-        chosen_case = "reports_test_141604";
-    }
-    else if ((hidden_size >= 2731) && (num_tokens >= 2731) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_203217";
-    }
-    else if ((hidden_size < 1365) && (num_tokens < 341) && (topk < 3)) {
-        chosen_case = "reports_test_140803";
-    }
-    else if ((hidden_size < 1365) && (num_tokens < 53) && (topk >= 3)) {
-        chosen_case = "reports_test_140803";
-    }
-    else if ((hidden_size >= 2731) && (num_tokens < 53) && (topk < 3)) {
-        chosen_case = "reports_test_161604";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 171 && num_tokens < 683) && (topk >= 3)) {
-        chosen_case = "reports_test_161604";
-    }
-    else if ((hidden_size >= 2731) && (num_tokens >= 53 && num_tokens < 98) && (topk >= 6)) {
-        chosen_case = "reports_test_203207";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens >= 98 && num_tokens < 2731) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_203207";
-    }
-    else if ((hidden_size < 1365) && (num_tokens >= 53 && num_tokens < 2731) && (topk >= 6)) {
-        chosen_case = "reports_test_203214";
-    }
-    else if ((hidden_size < 1365) && (num_tokens >= 341) && (topk < 3)) {
-        chosen_case = "reports_test_163202";
-    }
-    else if ((hidden_size < 1365) && (num_tokens >= 171 && num_tokens < 2731) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_203215";
-    }
-    else if ((hidden_size < 2731) && (num_tokens >= 2731) && (topk >= 3)) {
-        chosen_case = "reports_test_163201";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 98 && num_tokens < 171) && (topk >= 6)) {
-        chosen_case = "reports_test_163201";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 683 && num_tokens < 1365) && (topk >= 6)) {
-        chosen_case = "reports_test_163201";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 341) && (topk < 3)) {
-        chosen_case = "reports_test_170804";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 683 && num_tokens < 1365) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_160802";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens < 53) && (topk >= 3)) {
-        chosen_case = "reports_test_171604";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens >= 98) && (topk < 3)) {
-        chosen_case = "reports_test_170808";
-    }
-    else if ((hidden_size >= 5213 && hidden_size < 7646) && (num_tokens >= 98) && (topk >= 6)) {
-        chosen_case = "reports_test_161601";
-    }
-    else if ((hidden_size >= 5213) && (num_tokens < 53) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_170802";
-    }
-    else if ((hidden_size >= 5213) && (num_tokens < 53) && (topk >= 6)) {
+    std::string chosen_case = "reports_test_163202";
+    int total_items = num_tokens * topk;
+    if (topk >= 6 || total_items >= 8192) {
         chosen_case = "reports_test_203222";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 98 && num_tokens < 171)) {
-        chosen_case = "reports_test_173204";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 171 && num_tokens < 2731) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_163204";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 98 && num_tokens < 171) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_163204";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 171) && (topk >= 6)) {
-        chosen_case = "reports_test_173201";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 1365 && num_tokens < 2731) && (topk >= 3)) {
-        chosen_case = "reports_test_173201";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens >= 1365) && (topk >= 6)) {
-        chosen_case = "reports_test_173201";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 683 && num_tokens < 2731) && (topk < 3)) {
-        chosen_case = "reports_test_161603";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 53 && num_tokens < 98) && (topk >= 3)) {
-        chosen_case = "reports_test_161603";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 2731) && (topk < 3)) {
-        chosen_case = "reports_test_173202";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens >= 53 && num_tokens < 341) && (topk < 3)) {
-        chosen_case = "reports_test_160804";
-    }
-    else if ((hidden_size < 1365) && (num_tokens >= 53 && num_tokens < 171) && (topk >= 3 && topk < 6)) {
-        chosen_case = "reports_test_160803";
-    }
-    else if ((hidden_size >= 1365 && hidden_size < 2731) && (num_tokens < 53)) {
-        chosen_case = "reports_test_161605";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens >= 53 && num_tokens < 98) && (topk < 6)) {
-        chosen_case = "reports_test_161605";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens >= 98 && num_tokens < 341) && (topk >= 6)) {
-        chosen_case = "reports_test_173208";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 53 && num_tokens < 98) && (topk < 6)) {
-        chosen_case = "reports_test_163212";
-    }
-    else if ((hidden_size >= 7646) && (num_tokens >= 171 && num_tokens < 683) && (topk < 3)) {
-        chosen_case = "reports_test_161610";
-    }
-    else if ((hidden_size >= 2731 && hidden_size < 5213) && (num_tokens >= 341 && num_tokens < 1365) && (topk >= 6)) {
-        chosen_case = "reports_test_203212";
+    } else if (hidden_size >= 7646) {
+        chosen_case = "reports_test_170801";
+    } else {
+        chosen_case = "reports_test_163202";
     }
 
     auto in_dtype = hidden_states.scalar_type();
