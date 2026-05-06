@@ -49,11 +49,15 @@ void moe_scatter_dynamic_quant_impl(
     torch::Tensor& experts_token_start, torch::Tensor& hidden_states,
     torch::Tensor& experts_smooth_scale, torch::Tensor& scatter_tokens,
     torch::Tensor& scatter_per_token_scale, torch::Tensor& scatter_tokens_offset,
-    int64_t shared_experts_num, std::string chosen_case) {
+    int64_t shared_experts_num, int kernel_id) {
 
     int n_tokens = selected_experts.size(0);
     if (n_tokens <= 0) return;
     (void)shared_experts_num;
+
+    int version = kernel_id / 10000;
+    int unroll_arg = (kernel_id / 100) % 100;
+    int target_arg = kernel_id % 100;
 
     auto& queue = vllm::xpu::vllmGetQueue();
     int topk = selected_experts.size(1);
@@ -76,16 +80,15 @@ void moe_scatter_dynamic_quant_impl(
 
     int sub_group_snap = 32;
     int items_per_thread = 32;
-    bool use_v20_routing = false;
+    bool use_v20_routing = (version == 20);
 
-    if (chosen_case.find("2032") != std::string::npos) {
-        use_v20_routing = true;
-        if (chosen_case == "reports_test_203222") { sub_group_snap = 8; items_per_thread = 1; }
-        else if (chosen_case == "reports_test_203217") { sub_group_snap = 8; items_per_thread = 32; }
-        else if (chosen_case == "reports_test_203215") { sub_group_snap = 16; items_per_thread = 2; }
-        else if (chosen_case == "reports_test_203214") { sub_group_snap = 16; items_per_thread = 4; }
-        else if (chosen_case == "reports_test_203212") { sub_group_snap = 16; items_per_thread = 8; }
-        else if (chosen_case == "reports_test_203207") { sub_group_snap = 32; items_per_thread = 2; }
+    if (use_v20_routing) {
+        if (target_arg == 22) { sub_group_snap = 8; items_per_thread = 1; }
+        else if (target_arg == 17) { sub_group_snap = 8; items_per_thread = 32; }
+        else if (target_arg == 15) { sub_group_snap = 16; items_per_thread = 2; }
+        else if (target_arg == 14) { sub_group_snap = 16; items_per_thread = 4; }
+        else if (target_arg == 12) { sub_group_snap = 16; items_per_thread = 8; }
+        else if (target_arg == 7) { sub_group_snap = 32; items_per_thread = 2; }
     }
 
     int routing_wg = 256;
@@ -299,18 +302,15 @@ void moe_scatter_dynamic_quant_impl(
     };
 
     int best_unroll = 1;
-    bool is_slm = false;
-    
-    if (chosen_case.find("14") != std::string::npos || chosen_case.find("18") != std::string::npos) {
-        is_slm = true;
-    }
+    bool is_slm = (version == 14 || version == 18);
 
-    if (chosen_case.find("32") != std::string::npos && !use_v20_routing) best_unroll = 32;
-    else if (chosen_case.find("16") != std::string::npos && !use_v20_routing) best_unroll = 16;
-    else if (chosen_case.find("08") != std::string::npos) best_unroll = 8;
-    else if (chosen_case.find("04") != std::string::npos) best_unroll = 4;
-    else if (chosen_case.find("02") != std::string::npos) best_unroll = 2;
-    else best_unroll = 1;
+    if (!use_v20_routing) {
+        if (unroll_arg == 32) best_unroll = 32;
+        else if (unroll_arg == 16) best_unroll = 16;
+        else if (unroll_arg == 8) best_unroll = 8;
+        else if (unroll_arg == 4) best_unroll = 4;
+        else if (unroll_arg == 2) best_unroll = 2;
+    }
 
     while (best_unroll > 1 && (hd_size / (64 * best_unroll)) <= 0) {
         best_unroll /= 2;
@@ -344,9 +344,12 @@ void moe_swiglu_dynamic_quant_impl(
     torch::Tensor& scatter_tokens, torch::Tensor& smooth_scale,
     torch::Tensor& experts_token_count, torch::Tensor& experts_token_start,
     torch::Tensor& quant_tokens, torch::Tensor& per_token_scale,
-    int64_t total_experts_num, int64_t max_token_num, std::string chosen_case) {
+    int64_t total_experts_num, int64_t max_token_num, int kernel_id) {
 
     if (max_token_num <= 0 || total_experts_num <= 0) return;
+
+    int version = kernel_id / 10000;
+    int unroll_arg = (kernel_id / 100) % 100;
 
     auto& queue = vllm::xpu::vllmGetQueue();
     auto scatter_tokens_ptr = reinterpret_cast<T_in*>(scatter_tokens.data_ptr());
@@ -553,16 +556,13 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
     int best_unroll = 1;
-    bool is_slm = false;
+    bool is_slm = (version == 18);
     
-    if (chosen_case.find("18") != std::string::npos) is_slm = true;
-
-    if (chosen_case.find("32") != std::string::npos) best_unroll = 32;
-    else if (chosen_case.find("16") != std::string::npos) best_unroll = 16;
-    else if (chosen_case.find("08") != std::string::npos) best_unroll = 8;
-    else if (chosen_case.find("04") != std::string::npos) best_unroll = 4;
-    else if (chosen_case.find("02") != std::string::npos) best_unroll = 2;
-    else best_unroll = 1;
+    if (unroll_arg == 32) best_unroll = 32;
+    else if (unroll_arg == 16) best_unroll = 16;
+    else if (unroll_arg == 8) best_unroll = 8;
+    else if (unroll_arg == 4) best_unroll = 4;
+    else if (unroll_arg == 2) best_unroll = 2;
 
     while (best_unroll > 1 && (hidden_size / (64 * best_unroll)) <= 0) {
         best_unroll /= 2;
@@ -617,13 +617,11 @@ void moe_swiglu_dynamic_quant(
 
     int num_tokens = num_scattered; 
 
-    std::string chosen_case = "reports_test_180802"; 
+    int kernel_id = 180802; 
     if (hidden_size < 2731) {
-        chosen_case = "reports_test_181604";
+        kernel_id = 181604;
     } else if (hidden_size >= 7646) {
-        chosen_case = "reports_test_170801";
-    } else {
-        chosen_case = "reports_test_180802";
+        kernel_id = 170801;
     }
 
     auto in_dtype = scatter_tokens.scalar_type();
@@ -632,7 +630,7 @@ void moe_swiglu_dynamic_quant(
     DISPATCH_MOE_QUANT_IMPL(moe_swiglu_dynamic_quant_impl, 
                             scatter_tokens, smooth_scale, experts_token_count, 
                             experts_token_start, quant_tokens, per_token_scale, 
-                            total_experts_num, max_token_num, chosen_case);
+                            total_experts_num, max_token_num, kernel_id);
 }
 
 void moe_scatter_dynamic_quant(
@@ -651,14 +649,12 @@ void moe_scatter_dynamic_quant(
     int hidden_size = hd_size;
     int num_tokens = n_tokens;
 
-    std::string chosen_case = "reports_test_163202";
+    int kernel_id = 163202;
     int total_items = num_tokens * topk;
     if (topk >= 6 || total_items >= 8192) {
-        chosen_case = "reports_test_203222";
+        kernel_id = 203222;
     } else if (hidden_size >= 7646) {
-        chosen_case = "reports_test_170801";
-    } else {
-        chosen_case = "reports_test_163202";
+        kernel_id = 170801;
     }
 
     auto in_dtype = hidden_states.scalar_type();
@@ -668,5 +664,5 @@ void moe_scatter_dynamic_quant(
                             selected_experts, moe_weights, token_to_scatter_offset, 
                             experts_token_count, experts_token_start, hidden_states, 
                             experts_smooth_scale, scatter_tokens, scatter_per_token_scale, 
-                            scatter_tokens_offset, shared_experts_num, chosen_case);
+                            scatter_tokens_offset, shared_experts_num, kernel_id);
 }
