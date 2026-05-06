@@ -218,7 +218,7 @@ void moe_swiglu_dynamic_quant_impl(
     };
 
     // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
-    int target_wg = 2; 
+    int target_wg = 8; 
     
     int num_chunks = hidden_size / 64;
     int best_unroll = 1;
@@ -330,8 +330,9 @@ void moe_scatter_dynamic_quant_impl(
     auto scatter_tokens_offset_ptr = scatter_tokens_offset.data_ptr<int32_t>();
 
     // Pass 3: Gather, quantize, and scatter
-    auto launch_scatter = [&](auto unroll_tag) {
+    auto launch_scatter = [&](auto unroll_tag, auto slm_tag) {
         constexpr int UNROLL = decltype(unroll_tag)::value;
+        constexpr uint32_t SLM_BYTES = decltype(slm_tag)::value;
         constexpr int CHUNK = 64;
         constexpr int BS = CHUNK * UNROLL;
 
@@ -342,30 +343,25 @@ void moe_scatter_dynamic_quant_impl(
             cgh.depends_on(routing_event);
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens * topk, wg_size), sycl::range<2>(1, wg_size)),
             [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                
                 const int token_k_idx = item.get_group(0);
                 const int expert_id = selected_experts_ptr[token_k_idx];
                 
-                if (expert_id < 0 || expert_id >= n_expert_total) {
-                    return;
-                }
+                if (expert_id < 0 || expert_id >= n_expert_total) return;
 
-                // Increase SLM to handle OWORD block alignment: 1056B
-                slm_init(1056);
+                // SLM Caching
+                slm_init(SLM_BYTES); // Constexpr literal statically passed to compiler
 
                 const int loc_id = item.get_local_id(1);
-                
                 const int token_idx = token_k_idx / topk;
 
                 const int offset = token_to_scatter_offset_ptr[token_k_idx];
-                const int expert_start = ext_tokens_start_ptr[expert_id];
-
-                const int target_idx = expert_start + offset;
+                const int target_idx = ext_tokens_start_ptr[expert_id] + offset;
                 const float weight = moe_weights_ptr[token_k_idx];
+                uint32_t reduction_base = hd_size * sizeof(float);
 
                 simd<float, CHUNK> thread_max_vec = 0.0f;
 
-                // Pass 1 (Removed Cache Hints)
+                // Pass 1: Compute and Cache to SLM
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
@@ -375,54 +371,56 @@ void moe_scatter_dynamic_quant_impl(
                             smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
 
                         simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
-                        simd<float, CHUNK> smoothed_abs = sycl::ext::intel::esimd::abs(smoothed);
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(smoothed));
 
-                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, smoothed_abs);
+                        uint32_t base_offset = (hd_bid * BS + u * CHUNK) * 4;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            slm_block_store<float, 16>(base_offset + i * 64, smoothed.template select<16, 1>(i * 16));
+                        }
                     }
                 }
 
                 float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
 
-                // Use SLM Block Stores array spacing for max bandwidth (16-byte aligned natively)
-                slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max));
+                slm_block_store<float, 4>(reduction_base + loc_id * 16, simd<float, 4>(thread_max));
                 barrier();
 
                 float this_token_scale = 1.0f;
                 
                 if (loc_id == 0) {
                     float max_value_final = 0.0f;
-                    
                     for (int i = 0; i < wg_size; i++) {
-                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                        simd<float, 4> val = slm_block_load<float, 4>(reduction_base + i * 16);
                         if (val[0] > max_value_final) max_value_final = val[0];
                     }
 
                     float raw_token_scale = max_value_final / quant_max;
                     this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
-                    
-                    slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
+                    slm_block_store<float, 4>(reduction_base + 1024, simd<float, 4>(this_token_scale));
                 }
                 barrier();
 
-                this_token_scale = slm_block_load<float, 4>(1024)[0];
+                this_token_scale = slm_block_load<float, 4>(reduction_base + 1024)[0];
                 float recip_scale = 1.0f / this_token_scale;
 
-                // Pass 2 (Removed Cache Hints)
+                // Pass 2: SLM read only and Quantize
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
-                        simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
-                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
-                        simd<float, CHUNK> scale = block_load<float, CHUNK>(
-                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
-
-                        simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
+                        uint32_t base_offset = (hd_bid * BS + u * CHUNK) * 4;
+                        simd<float, CHUNK> cached_smoothed;
+                        
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            cached_smoothed.template select<16, 1>(i * 16) = slm_block_load<float, 16>(base_offset + i * 64);
+                        }
 
                         simd<T_out, CHUNK> quantized;
                         if constexpr (std::is_same_v<T_out, int8_t>) {
-                            quantized = rnde<float>(smoothed * recip_scale);
+                            quantized = rnde<float>(cached_smoothed * recip_scale);
                         } else {
-                            quantized = fast_cvt_float_to_e4m3fn<CHUNK>(smoothed * recip_scale);
+                            quantized = fast_cvt_float_to_e4m3fn<CHUNK>(cached_smoothed * recip_scale);
                         }
 
                         block_store<T_out, CHUNK>(
@@ -438,13 +436,49 @@ void moe_scatter_dynamic_quant_impl(
         });
     };
 
+    auto dispatch_slm = [&](auto unroll_tag) {
+        if (hd_size <=   128) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   2560>{}); //   128 * 4 + 2048
+        if (hd_size <=   256) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   3072>{}); //   256 * 4 + 2048
+        if (hd_size <=   512) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   4096>{}); //   512 * 4 + 2048
+        if (hd_size <=  1024) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,   6144>{}); //  1024 * 4 + 2048
+        if (hd_size <=  2048) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  10240>{}); //  2048 * 4 + 2048
+        if (hd_size <=  3072) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  14336>{}); //  3072 * 4 + 2048
+        if (hd_size <=  4096) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  18432>{}); //  4096 * 4 + 2048
+        if (hd_size <=  5120) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  22528>{}); //  5120 * 4 + 2048
+        if (hd_size <=  6144) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  26624>{}); //  6144 * 4 + 2048
+        if (hd_size <=  7168) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  30720>{}); //  7168 * 4 + 2048
+        if (hd_size <=  8192) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  34816>{}); //  8192 * 4 + 2048
+        if (hd_size <= 10240) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  43008>{}); // 10240 * 4 + 2048
+        if (hd_size <= 12288) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  51200>{}); // 12288 * 4 + 2048
+        if (hd_size <= 14336) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  59392>{}); // 14336 * 4 + 2048
+        if (hd_size <= 16384) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  67584>{}); // 16384 * 4 + 2048
+        if (hd_size <= 20480) return launch_scatter(unroll_tag, std::integral_constant<uint32_t,  83968>{}); // 20480 * 4 + 2048
+        if (hd_size <= 24576) return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 100352>{}); // 24576 * 4 + 2048
+        if (hd_size <= 28672) return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 116736>{}); // 28672 * 4 + 2048
+                              return launch_scatter(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
+    };
 
-    if (hd_size % 2048 == 0 && (hd_size / 2048) >= 2) return launch_scatter(std::integral_constant<int, 32>{});
-    if (hd_size % 1024 == 0 && (hd_size / 1024) >= 2) return launch_scatter(std::integral_constant<int, 16>{});
-    if (hd_size %  512 == 0 && (hd_size /  512) >= 2) return launch_scatter(std::integral_constant<int, 8>{});
-    if (hd_size %  256 == 0 && (hd_size /  256) >= 2) return launch_scatter(std::integral_constant<int, 4>{});
-    if (hd_size %  128 == 0 && (hd_size /  128) >= 2) return launch_scatter(std::integral_constant<int, 2>{});
-                                                      return launch_scatter(std::integral_constant<int, 1>{});
+    // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
+    int target_wg = 8; 
+    
+    int num_chunks = hd_size / 64;
+    int best_unroll = 1;
+
+    // Find the largest UNROLL that cleanly divides memory AND 
+    // preserves enough active blocks to meet target_wg.
+    for (int u : {8, 4, 2}) {
+        if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
+            best_unroll = u;
+            break;
+        }
+    }
+
+    switch (best_unroll) {
+        case 8:  return dispatch_slm(std::integral_constant<int, 8>{});
+        case 4:  return dispatch_slm(std::integral_constant<int, 4>{});
+        case 2:  return dispatch_slm(std::integral_constant<int, 2>{});
+        default: return dispatch_slm(std::integral_constant<int, 1>{});
+    }
 }
 
 // Outer dispatch macros to select implementation
