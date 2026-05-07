@@ -234,8 +234,8 @@ void moe_swiglu_dynamic_quant_impl(
     //int target_total_threads = 768;
     //int target_total_threads = 512;
     //int target_total_threads = 256;
-    int target_total_threads = 128;
-    //int target_total_threads = 64;
+    //int target_total_threads = 128;
+    int target_total_threads = 64;
 
     auto is_valid_unroll = [&](int unroll) {
         int bs = unroll * 64;
@@ -467,8 +467,8 @@ void moe_scatter_dynamic_quant_impl(
     //int target_total_threads = 768;
     //int target_total_threads = 512;
     //int target_total_threads = 256;
-    int target_total_threads = 128;
-    //int target_total_threads = 64;
+    //int target_total_threads = 128;
+    int target_total_threads = 64;
 
     auto is_valid_unroll = [&](int unroll) {
         int bs = unroll * 64;
