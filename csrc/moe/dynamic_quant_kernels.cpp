@@ -226,8 +226,8 @@ void moe_swiglu_dynamic_quant_impl(
     //int target_total_threads = 4096;
     //int target_total_threads = 6144;
     //int target_total_threads = 8192;
-    int target_total_threads = 10240;
-    //int target_total_threads = 12288;
+    //int target_total_threads = 10240;
+    int target_total_threads = 12288;
     //int target_total_threads = 16384;
     //int target_total_threads = 24576;
     //int target_total_threads = 32768;
@@ -454,8 +454,8 @@ void moe_scatter_dynamic_quant_impl(
     //int target_total_threads = 4096;
     //int target_total_threads = 6144;
     //int target_total_threads = 8192;
-    int target_total_threads = 10240;
-    //int target_total_threads = 12288;
+    //int target_total_threads = 10240;
+    int target_total_threads = 12288;
     //int target_total_threads = 16384;
     //int target_total_threads = 24576;
     //int target_total_threads = 32768;
