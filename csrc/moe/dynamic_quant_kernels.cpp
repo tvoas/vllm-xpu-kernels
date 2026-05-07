@@ -220,8 +220,8 @@ void moe_swiglu_dynamic_quant_impl(
     int total_swiglu_items = num_scattered;
     
     // The "inflection" threshold: Minimum total threads required to properly saturate the GPU.
-    int target_total_threads = 1024;
-    //int target_total_threads = 2048;
+    //int target_total_threads = 1024;
+    int target_total_threads = 2048;
     //int target_total_threads = 3072;
     //int target_total_threads = 4096;
     //int target_total_threads = 6144;
@@ -448,8 +448,8 @@ void moe_scatter_dynamic_quant_impl(
     int total_scatter_items = n_tokens * topk;
     
     // The "inflection" threshold: Minimum total threads required to properly saturate the GPU.
-    int target_total_threads = 1024;
-    //int target_total_threads = 2048;
+    //int target_total_threads = 1024;
+    int target_total_threads = 2048;
     //int target_total_threads = 3072;
     //int target_total_threads = 4096;
     //int target_total_threads = 6144;
