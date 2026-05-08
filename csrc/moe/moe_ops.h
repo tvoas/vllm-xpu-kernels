@@ -128,6 +128,7 @@ void moe_swiglu_dynamic_quant(
     torch::Tensor& smooth_scale,
     torch::Tensor& experts_token_count,
     torch::Tensor& experts_token_start,
+    torch::Tensor& scatter_expert_ids,
     torch::Tensor& quant_tokens,
     torch::Tensor& per_token_scale,
     int64_t total_experts_num,

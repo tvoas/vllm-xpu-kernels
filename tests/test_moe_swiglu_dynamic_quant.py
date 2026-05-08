@@ -64,6 +64,10 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts, src_d
     if num_experts > 1:
         experts_token_start[1:] = torch.cumsum(experts_token_count[:-1], dim=0)
     max_token_num = int(experts_token_count.max().item())
+    scatter_expert_ids = torch.repeat_interleave(
+        torch.arange(num_experts, dtype=torch.int32, device=device),
+        experts_token_count.to(torch.int64)
+    )
 
     scatter_tokens = torch.randn((num_scattered, hidden_size * 2), dtype=src_dtype, device=device)
     smooth_scale = torch.rand((num_experts, hidden_size), dtype=torch.float32, device=device)
@@ -82,6 +86,7 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts, src_d
     # 2. XPU Kernel Output
     torch.ops._moe_C.moe_swiglu_dynamic_quant(
         scatter_tokens, smooth_scale, experts_token_count, experts_token_start,
+        scatter_expert_ids,
         out_quant_tokens, out_per_scale, num_experts, max_token_num
     )
     torch.xpu.synchronize()
