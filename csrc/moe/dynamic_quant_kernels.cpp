@@ -217,7 +217,6 @@ void moe_swiglu_dynamic_quant_impl(
                                   return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
-    // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
     int target_wg = 2; 
     
     int num_chunks = hidden_size / 64;
@@ -440,18 +439,7 @@ void moe_scatter_dynamic_quant_impl(
 
     int total_scatter_items = n_tokens * topk;
     
-    // The "inflection" threshold: Minimum total threads required to properly saturate the GPU.
     int target_total_threads = 1024;
-    //int target_total_threads = 2048;
-    //int target_total_threads = 3072;
-    //int target_total_threads = 4096;
-    //int target_total_threads = 6144;
-    //int target_total_threads = 8192;
-    //int target_total_threads = 10240;
-    //int target_total_threads = 12288;
-    //int target_total_threads = 16384;
-    //int target_total_threads = 24576;
-    //int target_total_threads = 32768;
 
     auto is_valid_unroll = [&](int unroll) {
         int bs = unroll * 64;
