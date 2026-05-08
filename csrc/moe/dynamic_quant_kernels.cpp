@@ -217,38 +217,27 @@ void moe_swiglu_dynamic_quant_impl(
                                   return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
-    int total_swiglu_items = num_scattered;
+    // Configuration target for Work-Group size (e.g., 1, 2, 4, 8, 16, 32, 64)
+    int target_wg = 2; 
     
-    // The "inflection" threshold: Minimum total threads required to properly saturate the GPU.
-    //int target_total_threads = 1024;
-    //int target_total_threads = 2048;
-    //int target_total_threads = 3072;
-    //int target_total_threads = 4096;
-    //int target_total_threads = 6144;
-    //int target_total_threads = 8192;
-    //int target_total_threads = 10240;
-    //int target_total_threads = 12288;
-    //int target_total_threads = 16384;
-    //int target_total_threads = 24576;
-    //int target_total_threads = 32768;
-    //int target_total_threads = 768;
-    //int target_total_threads = 512;
-    //int target_total_threads = 256;
-    //int target_total_threads = 128;
-    int target_total_threads = 64;
+    int num_chunks = hidden_size / 64;
+    int best_unroll = 1;
 
-    auto is_valid_unroll = [&](int unroll) {
-        int bs = unroll * 64;
-        int max_wg_size = std::min(hidden_size / bs, 64);
-        return (hidden_size % bs == 0) && ((total_swiglu_items * max_wg_size) >= target_total_threads);
-    };
+    // Find the largest UNROLL that cleanly divides memory AND 
+    // preserves enough active blocks to meet target_wg.
+    for (int u : {8, 4, 2}) {
+        if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
+            best_unroll = u;
+            break;
+        }
+    }
 
-    if (is_valid_unroll(32)) return dispatch_slm(std::integral_constant<int, 32>{});
-    if (is_valid_unroll(16)) return dispatch_slm(std::integral_constant<int, 16>{});
-    if (is_valid_unroll(8))  return dispatch_slm(std::integral_constant<int, 8>{});
-    if (is_valid_unroll(4))  return dispatch_slm(std::integral_constant<int, 4>{});
-    if (is_valid_unroll(2))  return dispatch_slm(std::integral_constant<int, 2>{});
-                             return dispatch_slm(std::integral_constant<int, 1>{});
+    switch (best_unroll) {
+        case 8:  return dispatch_slm(std::integral_constant<int, 8>{});
+        case 4:  return dispatch_slm(std::integral_constant<int, 4>{});
+        case 2:  return dispatch_slm(std::integral_constant<int, 2>{});
+        default: return dispatch_slm(std::integral_constant<int, 1>{});
+    }
 }
 
 template <typename T_in, typename T_out>
@@ -452,7 +441,7 @@ void moe_scatter_dynamic_quant_impl(
     int total_scatter_items = n_tokens * topk;
     
     // The "inflection" threshold: Minimum total threads required to properly saturate the GPU.
-    //int target_total_threads = 1024;
+    int target_total_threads = 1024;
     //int target_total_threads = 2048;
     //int target_total_threads = 3072;
     //int target_total_threads = 4096;
@@ -463,11 +452,6 @@ void moe_scatter_dynamic_quant_impl(
     //int target_total_threads = 16384;
     //int target_total_threads = 24576;
     //int target_total_threads = 32768;
-    //int target_total_threads = 768;
-    //int target_total_threads = 512;
-    //int target_total_threads = 256;
-    //int target_total_threads = 128;
-    int target_total_threads = 64;
 
     auto is_valid_unroll = [&](int unroll) {
         int bs = unroll * 64;
