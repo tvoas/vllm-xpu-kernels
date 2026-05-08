@@ -50,6 +50,7 @@ void moe_swiglu_dynamic_quant_impl(
     torch::Tensor& smooth_scale,
     torch::Tensor& experts_token_count,
     torch::Tensor& experts_token_start,
+    torch::Tensor& scatter_expert_ids,
     torch::Tensor& quant_tokens,
     torch::Tensor& per_token_scale,
     int64_t total_experts_num,
@@ -63,8 +64,7 @@ void moe_swiglu_dynamic_quant_impl(
 
     auto scatter_tokens_ptr = reinterpret_cast<T_in*>(scatter_tokens.data_ptr());
     auto smooth_scale_ptr = smooth_scale.data_ptr<float>();
-    auto experts_token_count_ptr = experts_token_count.data_ptr<int32_t>();
-    auto experts_token_start_ptr = experts_token_start.data_ptr<int32_t>();
+    auto scatter_expert_ids_ptr = scatter_expert_ids.data_ptr<int32_t>();
     auto quant_tokens_ptr = reinterpret_cast<T_out*>(quant_tokens.data_ptr());
     auto per_token_scale_ptr = per_token_scale.data_ptr<float>();
 
@@ -91,23 +91,9 @@ void moe_swiglu_dynamic_quant_impl(
                 const int loc_id = item.get_local_id(1);
                 const int flat_idx = item.get_group(0);
 
-                int left = 0;
-                int right = total_experts_num - 1;
-                int expert_idx = 0;
-                
-                while (left <= right) {
-                    int mid = left + (right - left) / 2;
-                    int start = experts_token_start_ptr[mid];
-                    int count = experts_token_count_ptr[mid];
-                    
-                    if (flat_idx >= start && flat_idx < start + count) {
-                        expert_idx = mid;
-                        break;
-                    } else if (flat_idx < start) {
-                        right = mid - 1;
-                    } else {
-                        left = mid + 1;
-                    }
+                const int expert_idx = scatter_expert_ids_ptr[flat_idx];
+                if (expert_idx < 0 || expert_idx >= total_experts_num) {
+                    return;
                 }
 
                 T_in* scatter_token_base = scatter_tokens_ptr + flat_idx * 2 * hidden_size;
@@ -474,6 +460,7 @@ void moe_swiglu_dynamic_quant(
     torch::Tensor& smooth_scale,
     torch::Tensor& experts_token_count,
     torch::Tensor& experts_token_start,
+    torch::Tensor& scatter_expert_ids,
     torch::Tensor& quant_tokens,
     torch::Tensor& per_token_scale,
     int64_t total_experts_num,
@@ -486,6 +473,7 @@ void moe_swiglu_dynamic_quant(
     TORCH_CHECK(smooth_scale.is_contiguous(), "smooth_scale must be contiguous");
     TORCH_CHECK(experts_token_count.is_contiguous(), "experts_token_count must be contiguous");
     TORCH_CHECK(experts_token_start.is_contiguous(), "experts_token_start must be contiguous");
+    TORCH_CHECK(scatter_expert_ids.is_contiguous(), "scatter_expert_ids must be contiguous");
     TORCH_CHECK(quant_tokens.is_contiguous(), "quant_tokens must be contiguous");
     TORCH_CHECK(per_token_scale.is_contiguous(), "per_token_scale must be contiguous");
 
@@ -494,6 +482,7 @@ void moe_swiglu_dynamic_quant(
     TORCH_CHECK(per_token_scale.scalar_type() == at::ScalarType::Float, "per_token_scale must be Float32");
     TORCH_CHECK(experts_token_count.scalar_type() == at::ScalarType::Int, "experts_token_count must be Int32");
     TORCH_CHECK(experts_token_start.scalar_type() == at::ScalarType::Int, "experts_token_start must be Int32");
+    TORCH_CHECK(scatter_expert_ids.scalar_type() == at::ScalarType::Int, "scatter_expert_ids must be Int32");
 
     // Shape checks
     int64_t num_scattered = scatter_tokens.size(0);
@@ -504,6 +493,8 @@ void moe_swiglu_dynamic_quant(
     // Block size alignment check for ESIMD vectorized loads
     TORCH_CHECK(hidden_size >= 64 && hidden_size % 64 == 0, 
                 "hidden_size must be a positive multiple of 64 for vectorized XPU block loads, got ", hidden_size);
+    TORCH_CHECK(hidden_size <= 32256,
+                "hidden_size exceeds current SLM-backed MoeSwigluDynamicQuant limit of 32256, got ", hidden_size);
 
     TORCH_CHECK(quant_tokens.size(0) == num_scattered && quant_tokens.size(1) == hidden_size, 
                 "quant_tokens shape mismatch");
@@ -511,6 +502,7 @@ void moe_swiglu_dynamic_quant(
                 "smooth_scale shape mismatch");
     TORCH_CHECK(experts_token_count.size(0) == total_experts_num, "experts_token_count size mismatch");
     TORCH_CHECK(experts_token_start.size(0) == total_experts_num, "experts_token_start size mismatch");
+    TORCH_CHECK(scatter_expert_ids.size(0) == num_scattered, "scatter_expert_ids size mismatch");
     TORCH_CHECK(per_token_scale.size(0) == num_scattered, "per_token_scale size mismatch");
 
     auto in_dtype = scatter_tokens.scalar_type();
@@ -518,7 +510,7 @@ void moe_swiglu_dynamic_quant(
 
     DISPATCH_MOE_QUANT_IMPL(moe_swiglu_dynamic_quant_impl, 
                             scatter_tokens, smooth_scale, experts_token_count, 
-                            experts_token_start, quant_tokens, per_token_scale, 
+                            experts_token_start, scatter_expert_ids, quant_tokens, per_token_scale, 
                             total_experts_num, max_token_num);
 }
 

@@ -120,6 +120,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def(
       "moe_swiglu_dynamic_quant(Tensor scatter_tokens, Tensor smooth_scale, "
       "Tensor experts_token_count, Tensor experts_token_start, "
+      "Tensor scatter_expert_ids, "
       "Tensor! quant_tokens, Tensor! per_token_scale, "
       "int total_experts_num, int max_token_num) -> ()");
   m.impl(

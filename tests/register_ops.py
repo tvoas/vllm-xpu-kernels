@@ -493,6 +493,7 @@ def moe_swiglu_dynamic_quant(
     smooth_scale: torch.Tensor,
     experts_token_count: torch.Tensor,
     experts_token_start: torch.Tensor,
+    scatter_expert_ids: torch.Tensor,
     quant_tokens: torch.Tensor,
     per_token_scale: torch.Tensor,
     total_experts_num: int,
@@ -500,7 +501,7 @@ def moe_swiglu_dynamic_quant(
 ) -> None:
     torch.ops._moe_C.moe_swiglu_dynamic_quant(
         scatter_tokens, smooth_scale, experts_token_count,
-        experts_token_start, quant_tokens, per_token_scale,
+        experts_token_start, scatter_expert_ids, quant_tokens, per_token_scale,
         total_experts_num, max_token_num
     )
 
